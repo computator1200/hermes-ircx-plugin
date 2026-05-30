@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="430" viewBox="0 0 880 430" font-family="'JetBrains Mono','DejaVu Sans Mono',Consolas,monospace">
+  <defs>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2f3a"/>
+      <stop offset="1" stop-color="#23262f"/>
+    </linearGradient>
+  </defs>
+  <!-- window -->
+  <rect x="0" y="0" width="880" height="430" rx="12" fill="#161922"/>
+  <rect x="0" y="0" width="880" height="38" rx="12" fill="url(#bar)"/>
+  <rect x="0" y="26" width="880" height="12" fill="#23262f"/>
+  <circle cx="22" cy="19" r="6" fill="#ff5f56"/>
+  <circle cx="42" cy="19" r="6" fill="#ffbd2e"/>
+  <circle cx="62" cy="19" r="6" fill="#27c93f"/>
+  <text x="100" y="24" fill="#9aa4b2" font-size="13">#channel-to-test-matrix-bridge-features · Rizon  (Matrix ⇄ heisenbridge)</text>
+
+  <g font-size="13.5">
+    <!-- msg 1 -->
+    <text x="20" y="72"><tspan fill="#6b7280">16:53</tspan> <tspan fill="#56b6c2">&lt;undignifiedweeb&gt;</tspan> <tspan fill="#c9d1d9">HermesMiMo: hi! briefly introduce yourself —</tspan></text>
+    <text x="20" y="92"><tspan fill="#c9d1d9">                      what are you, and which model are you running on?</tspan></text>
+
+    <!-- reply 1 -->
+    <text x="20" y="120"><tspan fill="#6b7280">16:53</tspan> <tspan fill="#b083f0">&lt;HermesMiMo&gt;</tspan> <tspan fill="#c9d1d9">Hey! I'm HermesMiMo, a general-purpose assistant</tspan></text>
+    <text x="20" y="140"><tspan fill="#c9d1d9">                   running on </tspan><tspan fill="#e5c07b">mimo-v2.5-pro</tspan><tspan fill="#c9d1d9">, chatting over IRC. I'm not a</tspan></text>
+    <text x="20" y="160"><tspan fill="#c9d1d9">                   trading agent and have no Kraken account — that's not me!</tspan></text>
+
+    <!-- msg 2 -->
+    <text x="20" y="196"><tspan fill="#6b7280">16:54</tspan> <tspan fill="#56b6c2">&lt;undignifiedweeb&gt;</tspan> <tspan fill="#c9d1d9">HermesMiMo: using your IRC tools, join</tspan></text>
+    <text x="20" y="216"><tspan fill="#c9d1d9">                      ##hermes-ircx-demo, say hi there, then list your channels.</tspan></text>
+
+    <!-- tool action -->
+    <text x="20" y="244"><tspan fill="#6b7280">16:54</tspan> <tspan fill="#e5c07b" font-style="italic">∗ HermesMiMo invoked  irc_join → irc_say → irc_list_channels</tspan></text>
+
+    <!-- reply 2 -->
+    <text x="20" y="272"><tspan fill="#6b7280">16:54</tspan> <tspan fill="#b083f0">&lt;HermesMiMo&gt;</tspan> <tspan fill="#c9d1d9">Done. Joined ##hermes-ircx-demo and posted the</tspan></text>
+    <text x="20" y="292"><tspan fill="#c9d1d9">                   message. Currently in two channels:</tspan></text>
+    <text x="20" y="312"><tspan fill="#c9d1d9">                     1. #channel-to-test-matrix-bridge-features</tspan></text>
+    <text x="20" y="332"><tspan fill="#c9d1d9">                     2. ##hermes-ircx-demo</tspan>   <tspan fill="#7ee787">·  Nick: HermesMiMo</tspan></text>
+
+    <!-- prompt -->
+    <text x="20" y="372"><tspan fill="#56b6c2">undignifiedweeb</tspan><tspan fill="#6b7280"> on </tspan><tspan fill="#c9d1d9">#channel-to-test-matrix-bridge-features</tspan> <tspan fill="#7ee787">▏</tspan></text>
+  </g>
+
+  <!-- footer caption -->
+  <text x="20" y="408" fill="#6b7280" font-size="12">IRCX on Rizon · powered by Xiaomi MiMo v2.5-pro · verified-account auth · runtime channel agency</text>
+</svg>

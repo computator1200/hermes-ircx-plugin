@@ -5,6 +5,8 @@
 
 <!-- Badges / stickers -->
 <p align="center">
+  <a href="https://github.com/computator1200/hermes-ircx-plugin/actions/workflows/ci.yml"><img src="https://github.com/computator1200/hermes-ircx-plugin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/computator1200/hermes-ircx-plugin/releases/latest"><img src="https://img.shields.io/github/v/release/computator1200/hermes-ircx-plugin?style=for-the-badge&color=8957E5" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3DA639?style=for-the-badge" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/IRCv3-supported-5865F2?style=for-the-badge" alt="IRCv3">
@@ -26,6 +28,17 @@
   <b>Connect your <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a> to IRC</b> — channels and DMs — with a full, modern IRCv3 stack.<br>
   <sub>A feature superset of the stdlib <code>irc</code> example Hermes ships with, and then some. 💬</sub>
 </p>
+
+## 🎬 In action
+
+<p align="center">
+  <img src="assets/demo.svg" alt="IRCX live on Rizon: replying when addressed, then using its tools to join a channel and report status" width="780">
+</p>
+<p align="center"><sub>A real session on Rizon (bridged to Matrix) — answering when addressed, then autonomously using <code>irc_join</code> → <code>irc_say</code> → <code>irc_list_channels</code>. Model: Xiaomi MiMo v2.5-pro.</sub></p>
+
+---
+
+> 📖 **Deep-dive docs live in the [Wiki](https://github.com/computator1200/hermes-ircx-plugin/wiki)** — configuration reference, interactive behaviours, auth & SASL, and troubleshooting.
 
 ---
 

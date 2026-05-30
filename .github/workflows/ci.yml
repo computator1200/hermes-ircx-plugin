@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: lint & smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install irctokens ircstates pyyaml ruff
+      - name: Validate plugin.yaml
+        run: python -c "import yaml; yaml.safe_load(open('plugins/platforms/ircx/plugin.yaml')); print('plugin.yaml OK')"
+      - name: Byte-compile
+        run: |
+          python -m py_compile plugins/platforms/ircx/adapter.py plugins/platforms/ircx/__init__.py
+          python -m py_compile tests/test_ircx_adapter.py tests/test_ircx_features.py
+      - name: IRCv3 stack import smoke
+        run: python -c "import irctokens, ircstates; print('irctokens + ircstates OK')"
+      - name: Ruff (advisory)
+        continue-on-error: true
+        run: ruff check plugins/platforms/ircx/adapter.py
+
+  tests:
+    name: tests (against hermes-agent)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout IRCX plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+      - name: Checkout hermes-agent
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install hermes-agent + test tooling
+        working-directory: hermes-agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" || pip install -e .
+          pip install irctokens ircstates pytest pytest-asyncio pytest-timeout pyyaml
+      - name: Vendor the plugin + tests into the hermes-agent tree
+        run: |
+          cp -r plugin/plugins/platforms/ircx hermes-agent/plugins/platforms/ircx
+          cp plugin/tests/test_ircx_adapter.py plugin/tests/test_ircx_features.py hermes-agent/tests/gateway/
+      - name: Run IRCX test suite (91 tests)
+        working-directory: hermes-agent
+        run: |
+          python -m pytest \
+            tests/gateway/test_ircx_adapter.py \
+            tests/gateway/test_ircx_features.py \
+            -q -p no:cacheprovider
