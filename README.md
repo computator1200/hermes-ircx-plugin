@@ -38,7 +38,7 @@
 
 ---
 
-> 📖 **Deep-dive docs live in the [Wiki](https://github.com/computator1200/hermes-ircx-plugin/wiki)** — configuration reference, interactive behaviours, auth & SASL, and troubleshooting.
+> 📖 **Deep-dive docs:** [Configuration](docs/Configuration.md) · [Interactive Behaviours](docs/Interactive-Behaviours.md) · [Authentication & SASL](docs/Authentication-and-SASL.md) · [Troubleshooting](docs/Troubleshooting.md) — see [`docs/`](docs/) (also mirrored to the [Wiki](https://github.com/computator1200/hermes-ircx-plugin/wiki)).
 
 ---
 
