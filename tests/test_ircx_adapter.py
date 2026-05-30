@@ -658,6 +658,21 @@ class TestStandaloneSend:
         assert "error" in res
 
 
+def _core_patch_present() -> bool:
+    """True when CORE_PATCH.md (MessageEvent.tool_scope + _apply_tool_scope) is applied."""
+    try:
+        import dataclasses
+        import gateway.run as _gr
+        from gateway.platforms.base import MessageEvent as _ME
+        return hasattr(_gr, "_apply_tool_scope") and "tool_scope" in {f.name for f in dataclasses.fields(_ME)}
+    except Exception:
+        return False
+
+
+_CORE_PATCH = _core_patch_present()
+
+
+@pytest.mark.skipif(not _CORE_PATCH, reason="requires CORE_PATCH.md (tool_scope hook) applied to gateway")
 class TestToolScopeCoreHelper:
     """Exercise the generic gateway/run.py _apply_tool_scope hook."""
 

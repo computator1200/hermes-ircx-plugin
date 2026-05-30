@@ -1517,9 +1517,13 @@ class IRCXAdapter(BasePlatformAdapter):
             source=source,
             message_id=msg.get("msgid") or str(int(time.time() * 1000)),
             timestamp=ts,
-            tool_scope=self._resolve_tool_scope(identity, is_channel, target),
             channel_context=self._format_context(chat_id) if is_channel else None,
         )
+        # Attach tool scope as an instance attribute (not a constructor kwarg)
+        # so the plugin works on BOTH stock Hermes — where MessageEvent has no
+        # ``tool_scope`` field, so it's simply ignored — and patched Hermes,
+        # where CORE_PATCH.md adds the field + ``_apply_tool_scope`` enforcement.
+        event.tool_scope = self._resolve_tool_scope(identity, is_channel, target)
         await self.handle_message(event)
 
     def _should_chime_in(self, target: str) -> bool:
