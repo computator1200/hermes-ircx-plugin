@@ -1,5 +1,5 @@
 """
-IRCX — Production IRCv3 Platform Adapter for Hermes Agent
+IRCX — IRCv3 Platform Adapter for Hermes Agent
 =========================================================
 
 A gateway platform adapter that connects Hermes to one or more IRC channels
@@ -1211,7 +1211,7 @@ class IRCClient:
 # ===========================================================================
 
 class IRCXAdapter(BasePlatformAdapter):
-    """Production IRCv3 adapter implementing the BasePlatformAdapter contract."""
+    """IRCv3 adapter implementing the BasePlatformAdapter contract."""
 
     def __init__(self, config: Any, **kwargs: Any):
         super().__init__(config=config, platform=Platform("ircx"))
@@ -1906,7 +1906,7 @@ def interactive_setup() -> None:
         if not prompt_yes_no("Reconfigure IRCX?", False):
             return
 
-    print_info("Production IRCv3 gateway. SASL-capable, multi-channel, account-verified auth.")
+    print_info("IRCv3 gateway. SASL-capable, multi-channel, account-verified auth.")
     server = prompt("IRC server hostname (e.g. irc.libera.chat)", default=existing or "")
     if not server:
         print_warning("Server is required — skipping IRCX setup")

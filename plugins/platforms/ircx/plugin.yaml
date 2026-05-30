@@ -3,7 +3,7 @@ label: IRC
 kind: platform
 version: 1.0.0
 description: >
-  Production IRCv3 gateway adapter for Hermes Agent.  Connects to one or
+  Full-featured IRCv3 gateway adapter for Hermes Agent.  Connects to one or
   more IRC channels (and DMs) and relays messages to/from the Hermes agent.
   Built on the irctokens + ircstates IRCv3 stack: full capability
   negotiation, SASL (PLAIN / EXTERNAL / SCRAM-SHA-256), server-time,

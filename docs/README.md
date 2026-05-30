@@ -1,6 +1,6 @@
 # IRCX Wiki
 
-Production **IRCv3** platform adapter for [Hermes Agent](https://github.com/NousResearch/hermes-agent), built on `irctokens` + `ircstates`.
+A full **IRCv3** platform adapter for [Hermes Agent](https://github.com/NousResearch/hermes-agent), built on `irctokens` + `ircstates`.
 
 > Repo: **[computator1200/hermes-ircx-plugin](https://github.com/computator1200/hermes-ircx-plugin)** · Platform name: `ircx`
 
@@ -32,7 +32,7 @@ IRCX_ALLOWED_USERS=youraccount
 
 Restart the gateway. In a channel, address the bot by nick (`hermes-bot: hello`) and it replies.
 
-## What makes it "production"
+## What you get
 
 | Area | What you get |
 |---|---|

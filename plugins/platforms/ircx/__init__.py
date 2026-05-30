@@ -1,4 +1,4 @@
-"""IRCX — production IRCv3 platform adapter for Hermes Agent."""
+"""IRCX — IRCv3 platform adapter for Hermes Agent."""
 
 from .adapter import register
 

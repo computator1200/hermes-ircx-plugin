@@ -1,6 +1,6 @@
 <!-- Banner -->
 <p align="center">
-  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=12,20,30&height=210&section=header&text=IRCX&fontSize=82&fontColor=ffffff&desc=Production%20IRCv3%20adapter%20for%20Hermes%20Agent&descAlignY=72&descSize=20" alt="IRCX banner" />
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=12,20,30&height=210&section=header&text=IRCX&fontSize=82&fontColor=ffffff&desc=A%20full%20IRCv3%20adapter%20for%20Hermes%20Agent&descAlignY=72&descSize=20" alt="IRCX banner" />
 </p>
 
 <!-- Badges / stickers -->
@@ -44,7 +44,7 @@
 
 ## 🛰️ Why IRCX?
 
-Hermes ships only a minimal stdlib `irc` **example**. **IRCX** is the production-grade alternative — built on the de-facto-correct [`irctokens`](https://pypi.org/project/irctokens/) + [`ircstates`](https://pypi.org/project/ircstates/) IRCv3 libraries — that turns your agent into a real channel citizen: it authenticates properly, remembers conversations across disconnects, can manage its own channels on request, and can even chime into the conversation on its own.
+Hermes ships only a minimal stdlib `irc` **example**. **IRCX** is a more complete alternative — built on the spec-compliant [`irctokens`](https://pypi.org/project/irctokens/) + [`ircstates`](https://pypi.org/project/ircstates/) IRCv3 libraries — that turns your agent into a real channel citizen: it authenticates properly, remembers conversations across disconnects, can manage its own channels on request, and can even chime into the conversation on its own.
 
 > **Platform name:** `ircx` — coexists with the bundled `irc` example, so you can run both side-by-side and switch when ready.
 
@@ -167,7 +167,7 @@ cd <hermes-agent>
 
 ## 📦 Status
 
-> ![Status](https://img.shields.io/badge/status-working_&_tested,_young-yellow?style=flat-square) Well-tested and live-validated, but it hasn't had a long production soak yet. Issues and PRs very welcome! 🙌
+> ![Status](https://img.shields.io/badge/status-working_&_tested,_young-yellow?style=flat-square) Well-tested and live-validated, but it hasn't had a long real-world soak yet. Issues and PRs very welcome! 🙌
 
 <sub>Not affiliated with or endorsed by Nous Research.</sub>
 

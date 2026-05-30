@@ -1,4 +1,4 @@
-# IRCX — Production IRCv3 platform adapter for Hermes Agent
+# IRCX — IRCv3 platform adapter for Hermes Agent
 
 > **Advanced features** (see "Interactive agent behaviours" below): observe-mode
 > spontaneous contribution, runtime channel-agency tools (`irc_join` / `irc_part`
@@ -7,10 +7,10 @@
 
 A drop-in gateway platform plugin that connects Hermes to IRC with full
 IRCv3 support. Built on the [`irctokens`](https://pypi.org/project/irctokens/)
-+ [`ircstates`](https://pypi.org/project/ircstates/) stack — the de-facto
-correct, sans-IO IRCv3 parsing/state libraries.
++ [`ircstates`](https://pypi.org/project/ircstates/) stack — the spec-compliant,
+sans-IO IRCv3 parsing/state libraries.
 
-It is a production re-implementation of, and a superset of, the bundled
+It re-implements, and is a superset of, the bundled
 stdlib `irc` example plugin, and reaches feature parity with (and beyond)
 the [OpenClaw IRC channel](https://docs.openclaw.ai/channels/irc).
 
@@ -141,7 +141,7 @@ gateway:
 python -m pytest tests/gateway/test_ircx_adapter.py -q
 ```
 
-60 network-free tests cover config precedence, channel/key/group parsing,
+90+ network-free tests cover config precedence, channel/key/group parsing,
 message splitting (byte/unicode/protocol limits), markdown handling, the
 full CAP+SASL state machine, SCRAM-SHA-256/512 against a reference server
 implementation, nick-collision recovery, CTCP, mention gating, the

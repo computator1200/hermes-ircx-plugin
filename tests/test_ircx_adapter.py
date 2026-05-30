@@ -1,4 +1,4 @@
-"""Tests for the IRCX production IRCv3 platform adapter plugin.
+"""Tests for the IRCX IRCv3 platform adapter plugin.
 
 These tests are network-free: the IRC client engine is driven by feeding it
 raw protocol lines and inspecting the outbound send queue, so the full
