@@ -1,0 +1,2017 @@
+"""
+IRCX — Production IRCv3 Platform Adapter for Hermes Agent
+=========================================================
+
+A gateway platform adapter that connects Hermes to one or more IRC channels
+(and DMs) with full IRCv3 support, built on the ``irctokens`` + ``ircstates``
+stack.
+
+Highlights
+----------
+* **IRCv3 capability negotiation** (``CAP LS 302`` → ``REQ`` → ``END``) with a
+  configurable desired-cap set; only ACKed caps are used.
+* **SASL** authentication: ``PLAIN``, ``EXTERNAL`` (CertFP) and
+  ``SCRAM-SHA-256``.  Falls back to NickServ ``IDENTIFY`` when SASL is not
+  configured.
+* **Verified-account authorization** via ``account-tag`` / ``extended-join`` /
+  ``account-notify`` — authorize by the network-verified account, not the
+  spoofable nick.  Bare-nick matching is opt-in
+  (``dangerously_allow_name_matching``), mirroring OpenClaw's
+  ``dangerouslyAllowNameMatching``.
+* **Feature parity with the OpenClaw IRC channel**: ``groupPolicy`` /
+  ``groups`` / ``allowFrom`` / ``requireMention`` / per-channel + per-sender
+  tool scoping, multi-channel, channel keys, NickServ, server password.
+* **ISUPPORT-aware**: casemapping for nick/channel comparison, ``CHANTYPES``
+  for channel detection, ``LINELEN`` for splitting.
+* **Robustness**: outbound flood protection (token bucket), keepalive with
+  ping-timeout detection, graceful retryable-failure signalling so the
+  gateway's background reconnect watcher re-establishes the link and rejoins.
+* **CTCP**: replies to ``VERSION``/``PING``/``TIME``/``CLIENTINFO``/``SOURCE``
+  and renders ``ACTION`` (``/me``) inbound.
+* **Typing notifications** (IRCv3 ``+typing`` client tag) and **threaded
+  replies** (``+draft/reply``) when the server supports message tags.
+
+Configuration (``config.yaml``)::
+
+    gateway:
+      platforms:
+        ircx:
+          enabled: true
+          extra:
+            server: irc.libera.chat
+            port: 6697
+            use_tls: true
+            nickname: hermes-bot
+            username: hermes
+            realname: Hermes Agent
+            channels:
+              - "#hermes"
+              - { name: "#ops", key: "s3cret" }
+            sasl: { mechanism: PLAIN, username: hermes, password: "..." }
+            nickserv: { password: "..." }          # alternative to SASL
+            require_mention: true
+            group_policy: allowlist                 # or "open"
+            dangerously_allow_name_matching: false
+            allow_from: ["alice", "bob"]            # DM allowlist (accounts)
+            group_allow_from: ["alice"]             # global channel allowlist
+            groups:
+              "#ops":
+                require_mention: false
+                allow_from: ["alice"]
+                tools: ["read_file", "web_search"]  # scope tools in this channel
+                tools_by_sender:
+                  alice: ["*"]
+            max_message_length: 450
+            rate_limit: { burst: 5, per_second: 2 }
+
+Or via environment variables (``IRCX_*``, falling back to the bundled
+example's ``IRC_*`` names).  Env values override ``config.yaml``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import datetime
+import hashlib
+import hmac
+import logging
+import os
+import re
+import secrets
+import ssl
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# IRCv3 library stack (optional at import time so the module can still be
+# imported — and ``check_requirements`` can report a helpful install hint —
+# when the packages are not installed).
+# ---------------------------------------------------------------------------
+try:
+    import irctokens  # type: ignore
+    import ircstates  # type: ignore
+    from ircstates import numerics as _NUM  # type: ignore
+
+    _LIBS_OK = True
+    _LIBS_ERR = ""
+except Exception as _e:  # pragma: no cover - exercised only without deps
+    irctokens = None  # type: ignore
+    ircstates = None  # type: ignore
+    _NUM = None  # type: ignore
+    _LIBS_OK = False
+    _LIBS_ERR = str(_e)
+
+# Hermes gateway SDK.
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.config import Platform, PlatformConfig  # noqa: F401  (Platform used)
+
+INSTALL_HINT = "pip install irctokens ircstates"
+
+# IRCv3 capabilities we request when the server offers them.  We only ever
+# *use* the ones the server ACKs, so listing extras here is safe.
+DESIRED_CAPS = (
+    "sasl",
+    "message-tags",
+    "server-time",
+    "account-tag",
+    "account-notify",
+    "extended-join",
+    "away-notify",
+    "chghost",
+    "multi-prefix",
+    "userhost-in-names",
+    "cap-notify",
+    "echo-message",
+    "setname",
+    "batch",
+    "labeled-response",
+    "draft/message-redaction",
+    "draft/chathistory",
+)
+
+_CTCP_VERSION = "Hermes Agent IRCX (irctokens/ircstates)"
+
+
+# ===========================================================================
+# Configuration
+# ===========================================================================
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env(*names: str) -> Optional[str]:
+    """Return the first set, non-empty environment variable among *names*."""
+    for name in names:
+        val = os.getenv(name)
+        if val is not None and val.strip() != "":
+            return val.strip()
+    return None
+
+
+@dataclass
+class ChannelSpec:
+    """A channel to join, with optional key and per-channel overrides."""
+    name: str
+    key: Optional[str] = None
+    require_mention: Optional[bool] = None  # None = inherit global
+    allow_from: Optional[List[str]] = None  # None = inherit group_allow_from
+    tools: Optional[List[str]] = None
+    tools_by_sender: Dict[str, List[str]] = field(default_factory=dict)
+
+
+@dataclass
+class IRCXConfig:
+    """Fully-resolved IRCX configuration (env > config.yaml)."""
+    server: str = ""
+    port: int = 6697
+    use_tls: bool = True
+    tls_verify: bool = True
+    tls_client_cert: Optional[str] = None
+    tls_client_key: Optional[str] = None
+
+    nickname: str = "hermes-bot"
+    username: str = ""
+    realname: str = "Hermes Agent"
+    server_password: Optional[str] = None
+
+    sasl_mechanism: Optional[str] = None  # PLAIN | EXTERNAL | SCRAM-SHA-256
+    sasl_username: Optional[str] = None
+    sasl_password: Optional[str] = None
+
+    nickserv_password: Optional[str] = None
+    nickserv_service: str = "NickServ"
+
+    channels: List[ChannelSpec] = field(default_factory=list)
+
+    require_mention: bool = True
+    group_policy: str = "allowlist"  # allowlist | open
+    dangerously_allow_name_matching: bool = False
+
+    allow_from: List[str] = field(default_factory=list)        # DM allowlist
+    group_allow_from: List[str] = field(default_factory=list)  # channel allowlist
+
+    max_message_length: int = 450
+    rate_burst: int = 5
+    rate_per_second: float = 2.0
+    mention_aliases: List[str] = field(default_factory=list)
+
+    convert_formatting: bool = False  # markdown -> mIRC control codes
+    home_channel: Optional[str] = None
+    ping_interval: float = 120.0
+    ping_timeout: float = 60.0
+
+    # --- Observe / spontaneous contribution (Feature A) ---
+    observe_mode: bool = False           # process unaddressed channel chatter
+    spontaneous_probability: float = 0.0  # 0..1 chance to chime in unprompted
+    spontaneous_cooldown: float = 90.0    # min seconds between spontaneous posts/chan
+    context_buffer_size: int = 15         # recent lines kept per channel for context
+
+    # --- Runtime agency tools (Feature B) ---
+    allow_agent_join: bool = False        # let the agent JOIN/PART at runtime
+    joinable_channels: List[str] = field(default_factory=list)  # empty = any
+
+    # --- Context persistence across disconnects (Feature C) ---
+    log_dir: Optional[str] = None         # if set, log channel lines + replay tail
+    chathistory_limit: int = 50           # CHATHISTORY LATEST fetch size on (re)join
+
+    # ---- derived helpers -------------------------------------------------
+
+    def channel_names(self) -> List[str]:
+        return [c.name for c in self.channels]
+
+    def channel_spec(self, name_cf: str, casefold: Callable[[str], str]) -> Optional[ChannelSpec]:
+        for c in self.channels:
+            if casefold(c.name) == name_cf:
+                return c
+        return None
+
+
+def _parse_channels(raw: Any) -> List[ChannelSpec]:
+    """Parse channels from a list (str/dict) or a comma-separated string.
+
+    String form supports an inline key: ``"#ops secret"``.
+    """
+    specs: List[ChannelSpec] = []
+    if raw is None:
+        return specs
+    items: List[Any]
+    if isinstance(raw, str):
+        items = [p.strip() for p in raw.split(",") if p.strip()]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return specs
+
+    for item in items:
+        if isinstance(item, str):
+            parts = item.split(None, 1)
+            name = parts[0]
+            key = parts[1].strip() if len(parts) > 1 else None
+            specs.append(ChannelSpec(name=name, key=key))
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("channel") or "").strip()
+            if not name:
+                continue
+            specs.append(
+                ChannelSpec(
+                    name=name,
+                    key=item.get("key"),
+                    require_mention=item.get("require_mention"),
+                    allow_from=item.get("allow_from"),
+                    tools=item.get("tools"),
+                    tools_by_sender=item.get("tools_by_sender", {}) or {},
+                )
+            )
+    return specs
+
+
+def _coerce_str_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    if isinstance(raw, (list, tuple)):
+        return [str(p).strip() for p in raw if str(p).strip()]
+    return []
+
+
+def load_config(platform_config: Any) -> IRCXConfig:
+    """Build an :class:`IRCXConfig` from a ``PlatformConfig`` + environment.
+
+    Precedence: environment (``IRCX_*`` then legacy ``IRC_*``) overrides
+    ``config.yaml`` ``extra`` keys.
+    """
+    extra: Dict[str, Any] = getattr(platform_config, "extra", {}) or {}
+    cfg = IRCXConfig()
+
+    cfg.server = _env("IRCX_SERVER", "IRC_SERVER") or str(extra.get("server", extra.get("host", "")))
+
+    port_raw = _env("IRCX_PORT", "IRC_PORT") or extra.get("port")
+    use_tls_env = _env("IRCX_USE_TLS", "IRC_USE_TLS", "IRC_TLS")
+    if use_tls_env is not None:
+        cfg.use_tls = _truthy(use_tls_env)
+    else:
+        cfg.use_tls = bool(extra.get("use_tls", extra.get("tls", True)))
+    try:
+        cfg.port = int(port_raw) if port_raw is not None else (6697 if cfg.use_tls else 6667)
+    except (TypeError, ValueError):
+        cfg.port = 6697 if cfg.use_tls else 6667
+
+    tls_verify_env = _env("IRCX_TLS_VERIFY")
+    cfg.tls_verify = _truthy(tls_verify_env) if tls_verify_env is not None else bool(extra.get("tls_verify", True))
+    cfg.tls_client_cert = _env("IRCX_TLS_CLIENT_CERT") or extra.get("tls_client_cert")
+    cfg.tls_client_key = _env("IRCX_TLS_CLIENT_KEY") or extra.get("tls_client_key")
+
+    cfg.nickname = _env("IRCX_NICKNAME", "IRC_NICKNAME") or str(extra.get("nickname", "hermes-bot"))
+    cfg.username = _env("IRCX_USERNAME", "IRC_USERNAME") or str(extra.get("username", "")) or cfg.nickname
+    cfg.realname = _env("IRCX_REALNAME", "IRC_REALNAME") or str(extra.get("realname", "Hermes Agent"))
+    cfg.server_password = _env(
+        "IRCX_SERVER_PASSWORD", "IRC_SERVER_PASSWORD", "IRC_PASSWORD"
+    ) or extra.get("server_password")
+
+    # SASL (env or extra["sasl"] dict)
+    sasl_extra = extra.get("sasl") if isinstance(extra.get("sasl"), dict) else {}
+    cfg.sasl_mechanism = _env("IRCX_SASL_MECHANISM") or sasl_extra.get("mechanism")
+    if cfg.sasl_mechanism:
+        cfg.sasl_mechanism = cfg.sasl_mechanism.strip().upper()
+    cfg.sasl_username = _env("IRCX_SASL_USERNAME") or sasl_extra.get("username") or cfg.nickname
+    cfg.sasl_password = _env("IRCX_SASL_PASSWORD") or sasl_extra.get("password")
+
+    # NickServ (env or extra["nickserv"] dict)
+    ns_extra = extra.get("nickserv") if isinstance(extra.get("nickserv"), dict) else {}
+    cfg.nickserv_password = _env(
+        "IRCX_NICKSERV_PASSWORD", "IRC_NICKSERV_PASSWORD"
+    ) or ns_extra.get("password")
+    cfg.nickserv_service = _env("IRCX_NICKSERV_SERVICE") or ns_extra.get("service", "NickServ")
+
+    # Channels
+    chans = _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+    if chans is not None:
+        cfg.channels = _parse_channels(chans)
+    else:
+        cfg.channels = _parse_channels(extra.get("channels") or extra.get("channel"))
+
+    # Per-channel overrides from extra["groups"] (OpenClaw-style)
+    groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
+    if groups:
+        existing = {c.name.lower(): c for c in cfg.channels}
+        for chan_name, rule in groups.items():
+            if not isinstance(rule, dict):
+                continue
+            spec = existing.get(str(chan_name).lower())
+            if spec is None:
+                spec = ChannelSpec(name=str(chan_name))
+                cfg.channels.append(spec)
+                existing[str(chan_name).lower()] = spec
+            if "require_mention" in rule:
+                spec.require_mention = _truthy(rule["require_mention"])
+            if "allow_from" in rule:
+                spec.allow_from = _coerce_str_list(rule["allow_from"])
+            if "tools" in rule:
+                spec.tools = _coerce_str_list(rule["tools"])
+            if "tools_by_sender" in rule and isinstance(rule["tools_by_sender"], dict):
+                spec.tools_by_sender = {
+                    str(k): _coerce_str_list(v) for k, v in rule["tools_by_sender"].items()
+                }
+
+    rm_env = _env("IRCX_REQUIRE_MENTION", "IRC_REQUIRE_MENTION")
+    cfg.require_mention = _truthy(rm_env) if rm_env is not None else bool(extra.get("require_mention", True))
+
+    cfg.group_policy = (_env("IRCX_GROUP_POLICY") or str(extra.get("group_policy", "allowlist"))).strip().lower()
+    if cfg.group_policy not in {"allowlist", "open"}:
+        cfg.group_policy = "allowlist"
+
+    dnm_env = _env("IRCX_DANGEROUSLY_ALLOW_NAME_MATCHING")
+    cfg.dangerously_allow_name_matching = (
+        _truthy(dnm_env) if dnm_env is not None
+        else bool(extra.get("dangerously_allow_name_matching", False))
+    )
+
+    cfg.allow_from = _coerce_str_list(_env("IRCX_ALLOW_FROM") or extra.get("allow_from"))
+    cfg.group_allow_from = _coerce_str_list(_env("IRCX_GROUP_ALLOW_FROM") or extra.get("group_allow_from"))
+    cfg.mention_aliases = _coerce_str_list(extra.get("mention_aliases"))
+
+    mml = _env("IRCX_MAX_MESSAGE_LENGTH") or extra.get("max_message_length")
+    try:
+        cfg.max_message_length = int(mml) if mml is not None else 450
+    except (TypeError, ValueError):
+        cfg.max_message_length = 450
+
+    rl = extra.get("rate_limit") if isinstance(extra.get("rate_limit"), dict) else {}
+    try:
+        cfg.rate_burst = int(rl.get("burst", 5))
+    except (TypeError, ValueError):
+        cfg.rate_burst = 5
+    try:
+        cfg.rate_per_second = float(rl.get("per_second", 2.0))
+    except (TypeError, ValueError):
+        cfg.rate_per_second = 2.0
+
+    cfg.convert_formatting = bool(extra.get("convert_formatting", False))
+    cfg.home_channel = _env("IRCX_HOME_CHANNEL", "IRC_HOME_CHANNEL") or extra.get("home_channel")
+    if not cfg.home_channel and cfg.channels:
+        cfg.home_channel = cfg.channels[0].name
+
+    # --- Feature A: observe / spontaneous ---
+    obs_env = _env("IRCX_OBSERVE_MODE")
+    cfg.observe_mode = _truthy(obs_env) if obs_env is not None else bool(extra.get("observe_mode", False))
+    prob = _env("IRCX_SPONTANEOUS_PROBABILITY") or extra.get("spontaneous_probability")
+    try:
+        cfg.spontaneous_probability = max(0.0, min(1.0, float(prob))) if prob is not None else 0.0
+    except (TypeError, ValueError):
+        cfg.spontaneous_probability = 0.0
+    cd = _env("IRCX_SPONTANEOUS_COOLDOWN") or extra.get("spontaneous_cooldown")
+    try:
+        cfg.spontaneous_cooldown = float(cd) if cd is not None else 90.0
+    except (TypeError, ValueError):
+        cfg.spontaneous_cooldown = 90.0
+    cbs = _env("IRCX_CONTEXT_BUFFER") or extra.get("context_buffer_size")
+    try:
+        cfg.context_buffer_size = max(0, int(cbs)) if cbs is not None else 15
+    except (TypeError, ValueError):
+        cfg.context_buffer_size = 15
+
+    # --- Feature B: runtime agency ---
+    aj_env = _env("IRCX_ALLOW_AGENT_JOIN")
+    cfg.allow_agent_join = _truthy(aj_env) if aj_env is not None else bool(extra.get("allow_agent_join", False))
+    cfg.joinable_channels = _coerce_str_list(_env("IRCX_JOINABLE_CHANNELS") or extra.get("joinable_channels"))
+
+    # --- Feature C: persistence ---
+    cfg.log_dir = _env("IRCX_LOG_DIR") or extra.get("log_dir")
+    chl = _env("IRCX_CHATHISTORY_LIMIT") or extra.get("chathistory_limit")
+    try:
+        cfg.chathistory_limit = max(1, int(chl)) if chl is not None else 50
+    except (TypeError, ValueError):
+        cfg.chathistory_limit = 50
+
+    return cfg
+
+
+# ===========================================================================
+# Text formatting / IRC-safety helpers
+# ===========================================================================
+
+# mIRC control codes
+_C_BOLD = "\x02"
+_C_ITALIC = "\x1d"
+_C_RESET = "\x0f"
+
+
+def strip_irc_control_chars(text: str) -> str:
+    """Strip CR/LF/NUL so user content can't inject IRC commands."""
+    return text.replace("\r", " ").replace("\n", " ").replace("\x00", "")
+
+
+def strip_markdown(text: str) -> str:
+    """Convert common markdown to plain text for IRC."""
+    text = re.sub(r"```[\w-]*\n?", "", text)          # code fences
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)        # **bold**
+    text = re.sub(r"__(.+?)__", r"\1", text)            # __bold__
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)  # *italic*
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)  # _italic_
+    text = re.sub(r"`(.+?)`", r"\1", text)              # `code`
+    text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", text)        # image -> url
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)     # link -> text (url)
+    return text
+
+
+def markdown_to_irc(text: str) -> str:
+    """Convert a subset of markdown to mIRC formatting control codes."""
+    text = re.sub(r"```[\w-]*\n?", "", text)
+    text = re.sub(r"\*\*(.+?)\*\*", _C_BOLD + r"\1" + _C_BOLD, text)
+    text = re.sub(r"__(.+?)__", _C_BOLD + r"\1" + _C_BOLD, text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", _C_ITALIC + r"\1" + _C_ITALIC, text)
+    text = re.sub(r"`(.+?)`", r"\1", text)
+    text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    return text
+
+
+def split_message(content: str, target: str, user_limit: int, *, convert_formatting: bool = False) -> List[str]:
+    """Split *content* into IRC-safe lines.
+
+    Honours the ~512-byte protocol limit (after ``PRIVMSG <target> :``
+    overhead) and the configured ``user_limit`` (in bytes of content),
+    splitting on UTF-8 character boundaries and preferring spaces.
+    """
+    content = markdown_to_irc(content) if convert_formatting else strip_markdown(content)
+    overhead = len(f"PRIVMSG {target} :".encode("utf-8")) + 2  # + CRLF
+    max_bytes = 510 - overhead
+    limit = min(user_limit, max_bytes) if user_limit > 0 else max_bytes
+
+    lines: List[str] = []
+    for paragraph in content.split("\n"):
+        paragraph = strip_irc_control_chars(paragraph).rstrip()
+        if not paragraph:
+            continue
+        while paragraph:
+            if len(paragraph.encode("utf-8")) <= limit:
+                lines.append(paragraph)
+                break
+            low, high, best = 1, len(paragraph), 1
+            while low <= high:
+                mid = (low + high) // 2
+                if len(paragraph[:mid].encode("utf-8")) <= limit:
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            split_at = best
+            space = paragraph.rfind(" ", 0, split_at)
+            if space > split_at // 3:
+                split_at = space
+            lines.append(paragraph[:split_at].rstrip())
+            paragraph = paragraph[split_at:].lstrip()
+    return lines
+
+
+# ===========================================================================
+# SASL
+# ===========================================================================
+
+class SASLError(Exception):
+    pass
+
+
+def sasl_plain_payload(authcid: str, password: str, authzid: str = "") -> str:
+    raw = f"{authzid}\x00{authcid}\x00{password}".encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _chunk_authenticate(payload_b64: str) -> List[str]:
+    """Split a base64 SASL payload into 400-byte AUTHENTICATE chunks.
+
+    Per the IRCv3 SASL spec, a payload that is an exact multiple of 400
+    bytes requires a trailing empty ``+`` chunk so the server knows the
+    message is complete.
+    """
+    if payload_b64 == "":
+        return ["+"]
+    chunks: List[str] = []
+    for i in range(0, len(payload_b64), 400):
+        chunks.append(payload_b64[i:i + 400])
+    if len(payload_b64) % 400 == 0:
+        chunks.append("+")
+    return chunks
+
+
+class ScramClient:
+    """Minimal RFC 5802 SCRAM client (no channel binding).
+
+    Supports any SHA-family hash via ``hash_name`` (``"sha256"`` /
+    ``"sha512"``), so it works on networks offering SCRAM-SHA-256 or
+    SCRAM-SHA-512 (e.g. Libera.Chat offers the latter).
+    """
+
+    def __init__(self, username: str, password: str, hash_name: str = "sha256"):
+        self.username = username
+        self.password = password
+        self._hash_name = hash_name
+        self._cnonce = base64.b64encode(secrets.token_bytes(18)).decode("ascii")
+        self._client_first_bare = f"n={self._saslprep(username)},r={self._cnonce}"
+        self._auth_message = ""
+        self._server_signature = b""
+
+    @staticmethod
+    def _saslprep(value: str) -> str:
+        # Minimal SASLprep: escape '=' and ',' per SCRAM username rules.
+        return value.replace("=", "=3D").replace(",", "=2C")
+
+    def client_first(self) -> bytes:
+        return f"n,,{self._client_first_bare}".encode("utf-8")
+
+    def client_final(self, server_first: bytes) -> bytes:
+        attrs = dict(
+            part.split("=", 1) for part in server_first.decode("utf-8").split(",") if "=" in part
+        )
+        rnonce = attrs["r"]
+        if not rnonce.startswith(self._cnonce):
+            raise SASLError("SCRAM: server nonce does not extend client nonce")
+        salt = base64.b64decode(attrs["s"])
+        iterations = int(attrs["i"])
+        h = self._hash_name
+
+        salted = hashlib.pbkdf2_hmac(h, self.password.encode("utf-8"), salt, iterations)
+        client_key = hmac.new(salted, b"Client Key", h).digest()
+        stored_key = hashlib.new(h, client_key).digest()
+        channel_binding = base64.b64encode(b"n,,").decode("ascii")
+        client_final_no_proof = f"c={channel_binding},r={rnonce}"
+        auth_message = f"{self._client_first_bare},{server_first.decode('utf-8')},{client_final_no_proof}"
+        client_sig = hmac.new(stored_key, auth_message.encode("utf-8"), h).digest()
+        proof = bytes(a ^ b for a, b in zip(client_key, client_sig))
+
+        server_key = hmac.new(salted, b"Server Key", h).digest()
+        self._server_signature = hmac.new(server_key, auth_message.encode("utf-8"), h).digest()
+
+        proof_b64 = base64.b64encode(proof).decode("ascii")
+        return f"{client_final_no_proof},p={proof_b64}".encode("utf-8")
+
+    def verify_server_final(self, server_final: bytes) -> bool:
+        attrs = dict(
+            part.split("=", 1) for part in server_final.decode("utf-8").split(",") if "=" in part
+        )
+        verifier = base64.b64decode(attrs.get("v", ""))
+        return hmac.compare_digest(verifier, self._server_signature)
+
+
+# Backwards-compatible alias.
+ScramSha256Client = ScramClient
+
+
+def _scram_hash_for(mechanism: str) -> Optional[str]:
+    """Map a SCRAM mechanism name to a hashlib algorithm name."""
+    if not mechanism.upper().startswith("SCRAM-SHA-"):
+        return None
+    suffix = mechanism.upper().rsplit("-", 1)[-1]  # "256" / "512" / "512-256"
+    return {"256": "sha256", "512": "sha512"}.get(suffix)
+
+
+# ===========================================================================
+# IRC protocol client engine
+# ===========================================================================
+
+class IRCClient:
+    """Async IRCv3 client: connection, CAP/SASL negotiation, state, I/O.
+
+    The adapter owns one of these.  Inbound PRIVMSG/NOTICE are delivered via
+    the ``on_message`` async callback; connection loss is reported via
+    ``on_disconnect``.
+    """
+
+    def __init__(
+        self,
+        cfg: IRCXConfig,
+        *,
+        on_message: Callable[[Dict[str, Any]], Awaitable[None]],
+        on_disconnect: Optional[Callable[[str], Awaitable[None]]] = None,
+        nick_suffix: str = "",
+    ):
+        if not _LIBS_OK:
+            raise RuntimeError(f"irctokens/ircstates not available: {_LIBS_ERR}")
+        self.cfg = cfg
+        self._on_message = on_message
+        self._on_disconnect = on_disconnect
+        self._nick_suffix = nick_suffix
+
+        self.server = ircstates.Server(cfg.nickname)
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+
+        self._recv_task: Optional[asyncio.Task] = None
+        self._send_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._send_q: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+
+        self._desired_nick = cfg.nickname + nick_suffix
+        self._nick_attempt = 0
+
+        self._cap_available: Dict[str, str] = {}
+        self._cap_acked: set = set()
+        self._cap_requested: set = set()
+        self._cap_negotiating = False
+        self._cap_ls_buffer: List[str] = []
+
+        self._registered_evt = asyncio.Event()
+        self._sasl_done_evt = asyncio.Event()
+        self._sasl_ok = False
+        self._sasl_error: Optional[str] = None
+        self._scram: Optional[ScramSha256Client] = None
+
+        self._closing = False
+        self._last_rx = 0.0
+        self._awaiting_pong = False
+
+        # Batch refs that belong to a draft/chathistory replay (Feature C),
+        # so replayed messages can be flagged is_history and not re-answered.
+        self._chathistory_batches: set = set()
+
+    # ---- public properties ----------------------------------------------
+
+    @property
+    def current_nick(self) -> str:
+        return self.server.nickname or self._desired_nick
+
+    def casefold(self, value: str) -> str:
+        return self.server.casefold(value)
+
+    def casefold_equals(self, a: str, b: str) -> bool:
+        return self.server.casefold_equals(a, b)
+
+    def is_channel(self, target: str) -> bool:
+        try:
+            return self.server.is_channel(target)
+        except Exception:
+            return bool(target) and target[0] in "#&+!"
+
+    def has_cap(self, cap: str) -> bool:
+        return cap in self._cap_acked
+
+    # ---- connection lifecycle --------------------------------------------
+
+    def _make_ssl_context(self) -> Optional[ssl.SSLContext]:
+        if not self.cfg.use_tls:
+            return None
+        ctx = ssl.create_default_context()
+        if not self.cfg.tls_verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        if self.cfg.tls_client_cert:
+            ctx.load_cert_chain(
+                self.cfg.tls_client_cert,
+                self.cfg.tls_client_key or self.cfg.tls_client_cert,
+            )
+        return ctx
+
+    async def connect(self, timeout: float = 30.0) -> None:
+        """Open the connection and complete IRCv3 + registration handshake.
+
+        Raises on failure.  Idempotent: builds fresh state each call so the
+        gateway's reconnect watcher can re-invoke it.
+        """
+        self._reset_state()
+        ssl_ctx = self._make_ssl_context()
+        self._reader, self._writer = await asyncio.wait_for(
+            asyncio.open_connection(self.cfg.server, self.cfg.port, ssl=ssl_ctx),
+            timeout=timeout,
+        )
+        self._last_rx = asyncio.get_running_loop().time()
+
+        self._send_task = asyncio.create_task(self._send_loop(), name="ircx-send")
+        self._recv_task = asyncio.create_task(self._recv_loop(), name="ircx-recv")
+
+        # Begin capability negotiation, then registration.
+        self._cap_negotiating = True
+        self.send_line("CAP", ["LS", "302"])
+        if self.cfg.server_password:
+            self.send_line("PASS", [strip_irc_control_chars(self.cfg.server_password)])
+        self.send_line("NICK", [self._desired_nick])
+        # ``username`` may be empty when an IRCXConfig is built directly (the
+        # load_config path falls back to nick).  Guard here too so a bare
+        # config still produces a valid USER command (avoids 461).
+        self.send_line("USER", [self.cfg.username or self.cfg.nickname, "0", "*", self.cfg.realname or "Hermes Agent"])
+
+        try:
+            await asyncio.wait_for(self._registered_evt.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("IRC registration timed out (no RPL_WELCOME)") from exc
+
+        # NickServ IDENTIFY when SASL was not used.
+        if self.cfg.nickserv_password and not self._sasl_ok:
+            self.send_line(
+                "PRIVMSG",
+                [self.cfg.nickserv_service, f"IDENTIFY {strip_irc_control_chars(self.cfg.nickserv_password)}"],
+            )
+            await asyncio.sleep(1.5)
+
+        await self.join_configured_channels()
+
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop(), name="ircx-ping")
+
+    async def join_configured_channels(self) -> None:
+        keyed = [c for c in self.cfg.channels if c.key]
+        plain = [c for c in self.cfg.channels if not c.key]
+        if plain:
+            self.send_line("JOIN", [",".join(c.name for c in plain)])
+        for c in keyed:
+            self.send_line("JOIN", [c.name, c.key])
+
+    async def disconnect(self, message: str = "Hermes Agent shutting down") -> None:
+        self._closing = True
+        if self._writer and not self._writer.is_closing():
+            try:
+                self.send_line("QUIT", [message])
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+        for task in (self._keepalive_task, self._recv_task, self._send_task):
+            if task and not task.done():
+                task.cancel()
+        for task in (self._keepalive_task, self._recv_task, self._send_task):
+            if task:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        if self._writer:
+            try:
+                self._writer.close()
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+        self._reader = None
+        self._writer = None
+
+    def _reset_state(self) -> None:
+        self.server = ircstates.Server(self.cfg.nickname)
+        self._registered_evt = asyncio.Event()
+        self._sasl_done_evt = asyncio.Event()
+        self._sasl_ok = False
+        self._sasl_error = None
+        self._scram = None
+        self._cap_available.clear()
+        self._cap_acked.clear()
+        self._cap_requested.clear()
+        self._cap_ls_buffer.clear()
+        self._cap_negotiating = False
+        self._closing = False
+        self._nick_attempt = 0
+        self._desired_nick = self.cfg.nickname + self._nick_suffix
+        self._awaiting_pong = False
+        # drain any stale queued lines
+        while not self._send_q.empty():
+            try:
+                self._send_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    # ---- raw I/O ----------------------------------------------------------
+
+    def send_line(self, command: str, params: Optional[List[str]] = None, tags: Optional[Dict[str, str]] = None) -> None:
+        """Queue an IRC line for sending (rate-limited by the send loop)."""
+        line = irctokens.build(command, params or [], tags=tags)
+        self._send_q.put_nowait(line.format().encode("utf-8") + b"\r\n")
+
+    async def _send_loop(self) -> None:
+        """Drain the outbound queue with token-bucket flood protection."""
+        loop = asyncio.get_running_loop()
+        tokens = float(self.cfg.rate_burst)
+        last = loop.time()
+        refill = max(self.cfg.rate_per_second, 0.1)
+        try:
+            while True:
+                data = await self._send_q.get()
+                if data is None:
+                    break
+                now = loop.time()
+                tokens = min(self.cfg.rate_burst, tokens + (now - last) * refill)
+                last = now
+                if tokens < 1.0:
+                    await asyncio.sleep((1.0 - tokens) / refill)
+                    tokens = 0.0
+                else:
+                    tokens -= 1.0
+                if self._writer and not self._writer.is_closing():
+                    self._writer.write(data)
+                    await self._writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - network error path
+            logger.debug("IRCX send loop ended: %s", exc)
+
+    async def _recv_loop(self) -> None:
+        try:
+            while self._reader and not self._reader.at_eof():
+                data = await self._reader.read(4096)
+                if not data:
+                    break
+                self._last_rx = asyncio.get_running_loop().time()
+                self._awaiting_pong = False
+                for line in self.server.recv(data):
+                    try:
+                        self.server.parse_tokens(line)
+                    except Exception as exc:  # pragma: no cover
+                        logger.debug("IRCX state parse error: %s", exc)
+                    try:
+                        await self._handle_line(line)
+                    except Exception as exc:
+                        logger.warning("IRCX line handler error on %s: %s", line.command, exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover
+            logger.warning("IRCX receive loop error: %s", exc)
+        finally:
+            if not self._closing:
+                await self._fire_disconnect("connection closed")
+
+    async def _keepalive_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.cfg.ping_interval)
+                loop = asyncio.get_running_loop()
+                idle = loop.time() - self._last_rx
+                if idle < self.cfg.ping_interval:
+                    continue
+                if self._awaiting_pong and idle > (self.cfg.ping_interval + self.cfg.ping_timeout):
+                    await self._fire_disconnect("ping timeout")
+                    return
+                self._awaiting_pong = True
+                self.send_line("PING", [f"hermes{int(loop.time())}"])
+        except asyncio.CancelledError:
+            raise
+
+    async def _fire_disconnect(self, reason: str) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        if self._on_disconnect:
+            try:
+                await self._on_disconnect(reason)
+            except Exception:
+                pass
+
+    # ---- protocol dispatch -----------------------------------------------
+
+    async def _handle_line(self, line: Any) -> None:
+        command = line.command.upper()
+
+        if command == "PING":
+            self.send_line("PONG", line.params)
+            return
+        if command == "PONG":
+            self._awaiting_pong = False
+            return
+        if command == "CAP":
+            await self._handle_cap(line)
+            return
+        if command == "AUTHENTICATE":
+            await self._handle_authenticate(line)
+            return
+
+        if command == _NUM.RPL_WELCOME:  # 001
+            if line.params:
+                # ircstates already tracks nickname; keep desired in sync.
+                self._desired_nick = line.params[0]
+            self._registered_evt.set()
+            return
+
+        if command in (_NUM.ERR_NICKNAMEINUSE, "433", "436", "437"):
+            await self._handle_nick_in_use()
+            return
+
+        # SASL result numerics
+        if command in ("900",):  # RPL_LOGGEDIN
+            return
+        if command == "903":  # RPL_SASLSUCCESS
+            self._sasl_ok = True
+            self._finish_sasl()
+            return
+        if command in ("902", "904", "905", "906", "907", "908"):
+            self._sasl_error = f"SASL failed ({command})"
+            self._sasl_ok = False
+            self._finish_sasl()
+            return
+
+        if command in ("PRIVMSG", "NOTICE"):
+            await self._handle_privmsg(line, is_notice=(command == "NOTICE"))
+            return
+
+        # BATCH open/close — track draft/chathistory batches (Feature C).
+        if command == "BATCH" and line.params:
+            ref = line.params[0]
+            if ref.startswith("+"):
+                btype = line.params[1] if len(line.params) > 1 else ""
+                if btype in ("chathistory", "draft/chathistory"):
+                    self._chathistory_batches.add(ref[1:])
+            elif ref.startswith("-"):
+                self._chathistory_batches.discard(ref[1:])
+            return
+
+        # RPL_ENDOFNAMES (366) — channel fully joined; pull history (Feature C).
+        if command == "366" and len(line.params) >= 2:
+            await self._request_chathistory(line.params[1])
+            return
+
+    async def _request_chathistory(self, channel: str) -> None:
+        """Fetch recent backlog on (re)join where the server supports it."""
+        if not self.has_cap("draft/chathistory"):
+            return
+        try:
+            self.send_line("CHATHISTORY", ["LATEST", channel, "*", str(self.cfg.chathistory_limit)])
+        except Exception:
+            pass
+
+    async def _handle_nick_in_use(self) -> None:
+        self._nick_attempt += 1
+        base = self.cfg.nickname.rstrip("_0123456789")[:24] or "hermes-bot"
+        if self._nick_attempt == 1:
+            candidate = f"{base}_"
+        else:
+            candidate = f"{base}_{self._nick_attempt}"
+        self._desired_nick = candidate[:30]
+        self.send_line("NICK", [self._desired_nick])
+
+    # ---- CAP / SASL -------------------------------------------------------
+
+    async def _handle_cap(self, line: Any) -> None:
+        # Format: CAP <client> <subcmd> [*] :<caps>
+        if len(line.params) < 2:
+            return
+        subcmd = line.params[1].upper()
+
+        if subcmd == "LS":
+            more = len(line.params) >= 4 and line.params[2] == "*"
+            caps_str = line.params[-1]
+            self._cap_ls_buffer.append(caps_str)
+            if more:
+                return
+            for token in " ".join(self._cap_ls_buffer).split():
+                if "=" in token:
+                    name, value = token.split("=", 1)
+                else:
+                    name, value = token, ""
+                self._cap_available[name] = value
+            self._cap_ls_buffer.clear()
+            await self._request_caps()
+        elif subcmd == "ACK":
+            for cap in line.params[-1].split():
+                cap = cap.strip()
+                if cap:
+                    self._cap_acked.add(cap.lstrip("-"))
+            if "sasl" in self._cap_acked and self.cfg.sasl_mechanism and not self._sasl_done_evt.is_set():
+                await self._begin_sasl()
+            else:
+                self._maybe_end_cap()
+        elif subcmd == "NAK":
+            # Server refused our requested caps; proceed without them.
+            self._maybe_end_cap()
+        elif subcmd == "NEW":  # cap-notify: new caps offered post-registration
+            for token in line.params[-1].split():
+                name = token.split("=", 1)[0]
+                self._cap_available[name] = ""
+            wanted = [c for c in DESIRED_CAPS if c in self._cap_available and c not in self._cap_acked]
+            if wanted:
+                self.send_line("CAP", ["REQ", " ".join(wanted)])
+        elif subcmd == "DEL":
+            for token in line.params[-1].split():
+                self._cap_acked.discard(token)
+
+    async def _request_caps(self) -> None:
+        wanted = [c for c in DESIRED_CAPS if c in self._cap_available]
+        if self.cfg.sasl_mechanism and "sasl" not in wanted and "sasl" in self._cap_available:
+            wanted.append("sasl")
+        if not wanted:
+            self._maybe_end_cap()
+            return
+        self._cap_requested = set(wanted)
+        self.send_line("CAP", ["REQ", " ".join(wanted)])
+
+    def _maybe_end_cap(self) -> None:
+        if self._cap_negotiating and not self._registered_evt.is_set():
+            self._cap_negotiating = False
+            self.send_line("CAP", ["END"])
+
+    async def _begin_sasl(self) -> None:
+        mech = (self.cfg.sasl_mechanism or "PLAIN").upper()
+        hash_name = _scram_hash_for(mech)
+        if hash_name:
+            self._scram = ScramClient(
+                self.cfg.sasl_username or self.cfg.nickname,
+                self.cfg.sasl_password or "",
+                hash_name,
+            )
+        self.send_line("AUTHENTICATE", [mech])
+
+    async def _handle_authenticate(self, line: Any) -> None:
+        param = line.params[0] if line.params else "+"
+        mech = (self.cfg.sasl_mechanism or "PLAIN").upper()
+
+        if mech == "EXTERNAL":
+            if param == "+":
+                self.send_line("AUTHENTICATE", ["+"])  # authzid empty
+            return
+
+        if mech == "PLAIN":
+            if param == "+":
+                payload = sasl_plain_payload(
+                    self.cfg.sasl_username or self.cfg.nickname,
+                    self.cfg.sasl_password or "",
+                )
+                for chunk in _chunk_authenticate(payload):
+                    self.send_line("AUTHENTICATE", [chunk])
+            return
+
+        if _scram_hash_for(mech) and self._scram is not None:
+            if param == "+":
+                payload = base64.b64encode(self._scram.client_first()).decode("ascii")
+                for chunk in _chunk_authenticate(payload):
+                    self.send_line("AUTHENTICATE", [chunk])
+            else:
+                data = base64.b64decode(param)
+                if b"v=" in data and self._scram._server_signature:
+                    # server-final
+                    if self._scram.verify_server_final(data):
+                        self.send_line("AUTHENTICATE", ["+"])
+                    else:
+                        self._sasl_error = "SCRAM: server signature mismatch"
+                        self.send_line("AUTHENTICATE", ["*"])  # abort
+                else:
+                    # server-first -> client-final
+                    final = self._scram.client_final(data)
+                    payload = base64.b64encode(final).decode("ascii")
+                    for chunk in _chunk_authenticate(payload):
+                        self.send_line("AUTHENTICATE", [chunk])
+            return
+
+    def _finish_sasl(self) -> None:
+        if not self._sasl_done_evt.is_set():
+            self._sasl_done_evt.set()
+            self._maybe_end_cap()
+
+    # ---- inbound messages -------------------------------------------------
+
+    async def _handle_privmsg(self, line: Any, *, is_notice: bool) -> None:
+        if not line.source or not line.params:
+            return
+        sender_nick = line.hostmask.nickname if line.hostmask else line.source.split("!", 1)[0]
+        target = line.params[0]
+        text = line.params[1] if len(line.params) > 1 else ""
+
+        # Ignore our own echoed messages (echo-message capability).
+        if self.casefold_equals(sender_nick, self.current_nick):
+            return
+
+        # CTCP handling.
+        if text.startswith("\x01"):
+            handled = await self._handle_ctcp(sender_nick, target, text, is_notice=is_notice)
+            if handled is not None:
+                text = handled  # ACTION rendered as text
+            else:
+                return  # other CTCP consumed
+
+        # Verified account (account-tag) if present.
+        account = line.tags.get("account") if line.tags else None
+        if not account:
+            user = self.server.users.get(self.casefold(sender_nick)) if hasattr(self.server, "users") else None
+            account = getattr(user, "account", None) if user else None
+
+        server_time = line.tags.get("time") if line.tags else None
+        msgid = line.tags.get("msgid") if line.tags else None
+
+        # draft/chathistory replay: messages inside a chathistory batch are
+        # backlog, not live — flag so the adapter buffers/logs but never
+        # answers them (Feature C).
+        batch_ref = line.tags.get("batch") if line.tags else None
+        is_history = bool(batch_ref and batch_ref in self._chathistory_batches)
+
+        await self._on_message(
+            {
+                "sender_nick": sender_nick,
+                "account": account or None,
+                "target": target,
+                "text": text,
+                "is_notice": is_notice,
+                "is_channel": self.is_channel(target),
+                "msgid": msgid,
+                "server_time": server_time,
+                "is_history": is_history,
+                "tags": dict(line.tags) if line.tags else {},
+            }
+        )
+
+    async def _handle_ctcp(self, sender_nick: str, target: str, text: str, *, is_notice: bool) -> Optional[str]:
+        body = text.strip("\x01")
+        parts = body.split(" ", 1)
+        ctcp_cmd = parts[0].upper()
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if ctcp_cmd == "ACTION":
+            return f"* {sender_nick} {arg}"
+
+        # Don't reply to CTCP arriving in NOTICE (those are replies already).
+        if is_notice:
+            return None
+
+        replies = {
+            "VERSION": _CTCP_VERSION,
+            "SOURCE": "https://github.com/NousResearch/hermes-agent",
+            "CLIENTINFO": "ACTION CLIENTINFO PING SOURCE TIME VERSION",
+            "PING": arg,
+            "TIME": datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"),
+        }
+        if ctcp_cmd in replies:
+            self.send_line("NOTICE", [sender_nick, f"\x01{ctcp_cmd} {replies[ctcp_cmd]}\x01".rstrip()])
+        return None
+
+    # ---- outbound messaging ----------------------------------------------
+
+    def privmsg(self, target: str, text: str, *, reply_to: Optional[str] = None) -> None:
+        tags: Optional[Dict[str, str]] = None
+        if reply_to and self.has_cap("message-tags"):
+            tags = {"+draft/reply": reply_to}
+        self.send_line("PRIVMSG", [target, strip_irc_control_chars(text)], tags=tags)
+
+    def send_typing(self, target: str, state: str = "active") -> None:
+        if self.has_cap("message-tags"):
+            self.send_line("TAGMSG", [target], tags={"+typing": state})
+
+    # ---- runtime channel agency (Feature B) ------------------------------
+
+    def join(self, channel: str, key: Optional[str] = None) -> None:
+        self.send_line("JOIN", [channel, key] if key else [channel])
+
+    def part(self, channel: str, reason: Optional[str] = None) -> None:
+        self.send_line("PART", [channel, reason] if reason else [channel])
+
+    def joined_channels(self) -> List[str]:
+        try:
+            return [getattr(c, "name", k) for k, c in self.server.channels.items()]
+        except Exception:
+            return []
+
+    def in_channel(self, channel: str) -> bool:
+        try:
+            return self.server.has_channel(channel)
+        except Exception:
+            cf = self.casefold(channel)
+            return any(self.casefold(c) == cf for c in self.joined_channels())
+
+
+# ===========================================================================
+# Hermes platform adapter
+# ===========================================================================
+
+class IRCXAdapter(BasePlatformAdapter):
+    """Production IRCv3 adapter implementing the BasePlatformAdapter contract."""
+
+    def __init__(self, config: Any, **kwargs: Any):
+        super().__init__(config=config, platform=Platform("ircx"))
+        self.cfg = load_config(config)
+        self._client: Optional[IRCClient] = None
+        self._lock_key: Optional[str] = None
+        # Rolling per-channel context buffers (deques of "nick: text").
+        from collections import deque as _deque
+        self._buffers: Dict[str, "Any"] = {}
+        self._deque = _deque
+        self._last_spontaneous: Dict[str, float] = {}
+
+    @property
+    def name(self) -> str:
+        return "IRC"
+
+    # ---- context buffer + logging (Features A & C) -----------------------
+
+    def _buf(self, chat_id: str):
+        cf = self._client.casefold(chat_id) if self._client else chat_id.lower()
+        if cf not in self._buffers:
+            self._buffers[cf] = self._deque(maxlen=max(1, self.cfg.context_buffer_size))
+            self._seed_buffer_from_log(chat_id, self._buffers[cf])
+        return self._buffers[cf]
+
+    def _record_line(self, chat_id: str, sender: str, text: str) -> None:
+        self._buf(chat_id).append(f"{sender}: {text}")
+        self._append_log(chat_id, sender, text)
+
+    def _format_context(self, chat_id: str) -> Optional[str]:
+        buf = self._buffers.get(self._client.casefold(chat_id) if self._client else chat_id.lower())
+        if not buf:
+            return None
+        lines = list(buf)[:-1]  # exclude the triggering line itself
+        if not lines:
+            return None
+        return "Recent channel conversation:\n" + "\n".join(lines)
+
+    def _log_path(self, chat_id: str) -> Optional["Any"]:
+        if not self.cfg.log_dir:
+            return None
+        import os as _os
+        safe = re.sub(r"[^A-Za-z0-9#&_.-]", "_", f"{self.cfg.server}_{chat_id}")
+        d = self.cfg.log_dir
+        try:
+            _os.makedirs(d, exist_ok=True)
+        except Exception:
+            return None
+        return _os.path.join(d, safe + ".log")
+
+    def _append_log(self, chat_id: str, sender: str, text: str) -> None:
+        path = self._log_path(chat_id)
+        if not path:
+            return
+        try:
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"{ts}\t{sender}\t{text}\n")
+        except Exception:
+            pass
+
+    def _seed_buffer_from_log(self, chat_id: str, buf) -> None:
+        """Replay the tail of the on-disk log so context survives restarts."""
+        path = self._log_path(chat_id)
+        if not path:
+            return
+        try:
+            import os as _os
+            if not _os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as fh:
+                tail = fh.readlines()[-buf.maxlen:]
+            for row in tail:
+                parts = row.rstrip("\n").split("\t", 2)
+                if len(parts) == 3:
+                    buf.append(f"{parts[1]}: {parts[2]}")
+        except Exception:
+            pass
+
+    # ---- lifecycle --------------------------------------------------------
+
+    async def connect(self) -> bool:
+        if not _LIBS_OK:
+            self._set_fatal_error("deps_missing", f"{INSTALL_HINT} ({_LIBS_ERR})", retryable=False)
+            return False
+        if not self.cfg.server or not self.cfg.channels:
+            self._set_fatal_error("config_missing", "IRCX_SERVER and IRCX_CHANNEL must be set", retryable=False)
+            return False
+
+        # Prevent two profiles from claiming the same IRC identity.
+        if not self._acquire_platform_lock("ircx", f"{self.cfg.server}:{self.cfg.nickname}",
+                                           f"{self.cfg.nickname}@{self.cfg.server}"):
+            self._set_fatal_error("lock_conflict", "IRC identity in use by another profile", retryable=False)
+            return False
+
+        self._client = IRCClient(
+            self.cfg,
+            on_message=self._on_irc_message,
+            on_disconnect=self._on_irc_disconnect,
+        )
+        try:
+            await self._client.connect()
+        except Exception as exc:
+            logger.error("IRCX: connect failed: %s", exc)
+            retryable = not isinstance(exc, ssl.SSLCertVerificationError)
+            self._set_fatal_error("connect_failed", str(exc), retryable=retryable)
+            self._release_platform_lock()
+            return False
+
+        self._mark_connected()
+        logger.info(
+            "IRCX: connected to %s:%s as %s; joined %s",
+            self.cfg.server, self.cfg.port, self._client.current_nick,
+            ", ".join(self.cfg.channel_names()),
+        )
+        return True
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+        if self._client:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+        self._release_platform_lock()
+
+    async def _on_irc_disconnect(self, reason: str) -> None:
+        if not self.is_connected:
+            return
+        logger.warning("IRCX: %s — marking disconnected for reconnect", reason)
+        self._set_fatal_error("connection_lost", f"IRC connection lost: {reason}", retryable=True)
+        await self._notify_fatal_error()
+
+    # ---- authorization & mention gating ----------------------------------
+
+    def _channel_spec(self, target: str) -> Optional[ChannelSpec]:
+        if not self._client:
+            return None
+        return self.cfg.channel_spec(self._client.casefold(target), self._client.casefold)
+
+    def _require_mention_for(self, target: str) -> bool:
+        spec = self._channel_spec(target)
+        if spec is not None and spec.require_mention is not None:
+            return spec.require_mention
+        return self.cfg.require_mention
+
+    def _strip_mention(self, text: str) -> Tuple[str, bool]:
+        """Return (text_without_mention, was_addressed)."""
+        nick = self._client.current_nick if self._client else self.cfg.nickname
+        candidates = [nick] + list(self.cfg.mention_aliases)
+        for name in candidates:
+            for sep in (":", ",", " "):
+                prefix = f"{name}{sep}"
+                if text.lower().startswith(prefix.lower()):
+                    return text[len(prefix):].strip(), True
+        return text, False
+
+    def _resolve_identity(self, sender_nick: str, account: Optional[str]) -> Optional[str]:
+        """Identity used for authorization.
+
+        Prefer the network-verified account.  Fall back to the bare nick
+        only when ``dangerously_allow_name_matching`` is enabled.
+        """
+        if account:
+            return account
+        if self.cfg.dangerously_allow_name_matching:
+            return sender_nick
+        return None
+
+    def _is_authorized(self, identity: Optional[str], is_channel: bool, target: str) -> bool:
+        # allow-all (env or extra) short-circuit
+        if _truthy(_env("IRCX_ALLOW_ALL_USERS", "IRC_ALLOW_ALL_USERS") or ""):
+            return True
+        if identity is None:
+            return False
+        ident_l = identity.lower()
+
+        if is_channel:
+            spec = self._channel_spec(target)
+            allow = spec.allow_from if (spec and spec.allow_from is not None) else self.cfg.group_allow_from
+            # An explicit (possibly empty) channel allowlist is authoritative.
+            if spec and spec.allow_from is not None:
+                return ident_l in {a.lower() for a in allow}
+            if self.cfg.group_allow_from:
+                return ident_l in {a.lower() for a in self.cfg.group_allow_from}
+            # No channel allowlist configured: fall through to global list.
+        else:
+            if self.cfg.allow_from:
+                return ident_l in {a.lower() for a in self.cfg.allow_from}
+
+        env_list = _coerce_str_list(_env("IRCX_ALLOWED_USERS", "IRC_ALLOWED_USERS"))
+        if env_list:
+            return ident_l in {a.lower() for a in env_list}
+        # No adapter-side allowlist configured — defer to the gateway's
+        # central _is_user_authorized (pairing / global allow-all).
+        return True
+
+    def _resolve_tool_scope(
+        self, identity: Optional[str], is_channel: bool, target: str
+    ) -> Optional[List[str]]:
+        """Per-channel / per-sender toolset allowlist for this turn.
+
+        Mirrors OpenClaw ``groups.<chan>.tools`` / ``tools_by_sender``.
+        Entries are Hermes *toolset* names (e.g. ``hermes-cli``, ``web``,
+        ``memory``).  ``tools_by_sender`` (matched on the resolved identity,
+        case-insensitive) takes precedence over the channel-wide ``tools``.
+        Returns ``None`` (or ``["*"]``) for no restriction; the gateway
+        intersects this turn's enabled toolsets with the result.
+        """
+        if not is_channel:
+            return None
+        spec = self._channel_spec(target)
+        if spec is None:
+            return None
+        if identity and spec.tools_by_sender:
+            lowered = {k.lower(): v for k, v in spec.tools_by_sender.items()}
+            scoped = lowered.get(identity.lower())
+            if scoped is not None:
+                return scoped
+        return spec.tools
+
+    # ---- inbound dispatch -------------------------------------------------
+
+    async def _on_irc_message(self, msg: Dict[str, Any]) -> None:
+        if not self._message_handler:
+            return
+        if msg["is_notice"]:
+            return  # never treat NOTICE as a prompt (loop-safety)
+
+        sender_nick = msg["sender_nick"]
+        text = msg["text"]
+        is_channel = msg["is_channel"]
+        target = msg["target"]
+        spontaneous = False
+
+        if is_channel:
+            # group_policy: in allowlist mode only handle configured channels.
+            if self.cfg.group_policy == "allowlist" and self._channel_spec(target) is None:
+                return
+
+            # Record every channel line for rolling context + logging.  Backlog
+            # replayed via draft/chathistory is recorded but never answered.
+            self._record_line(target, sender_nick, text)
+            if msg.get("is_history"):
+                return
+
+            if self._require_mention_for(target):
+                text, addressed = self._strip_mention(text)
+                if not addressed:
+                    # Unaddressed chatter.  In observe mode the bot may
+                    # spontaneously chime in (probability + per-channel
+                    # cooldown); otherwise it stays quiet.
+                    if not self._should_chime_in(target):
+                        return
+                    spontaneous = True
+            chat_id = target
+            chat_type = "group"
+        else:
+            chat_id = sender_nick
+            chat_type = "dm"
+            self._record_line(chat_id, sender_nick, text)
+            if msg.get("is_history"):
+                return
+
+        identity = self._resolve_identity(sender_nick, msg.get("account"))
+        if not self._is_authorized(identity, is_channel, target):
+            logger.debug("IRCX: dropping message from unauthorized %s (account=%s)", sender_nick, msg.get("account"))
+            return
+
+        # Feed the verified account (or nick) as user_id so the gateway's
+        # central _is_user_authorized matches IRCX_ALLOWED_USERS correctly.
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_id,
+            chat_type=chat_type,
+            user_id=identity or sender_nick,
+            user_name=sender_nick,
+            message_id=msg.get("msgid"),
+        )
+
+        ts = datetime.datetime.now()
+        if msg.get("server_time"):
+            try:
+                ts = datetime.datetime.fromisoformat(msg["server_time"].replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+        effective_text = text
+        if spontaneous:
+            # Frame the turn so the agent contributes naturally and may opt
+            # to stay silent.
+            effective_text = (
+                f"[ambient channel message from {sender_nick}] {text}\n\n"
+                "(You are observing the channel and may optionally contribute a "
+                "brief, relevant remark. If you have nothing useful to add, reply "
+                "with exactly: <silent>)"
+            )
+
+        event = MessageEvent(
+            text=effective_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=msg.get("msgid") or str(int(time.time() * 1000)),
+            timestamp=ts,
+            tool_scope=self._resolve_tool_scope(identity, is_channel, target),
+            channel_context=self._format_context(chat_id) if is_channel else None,
+        )
+        await self.handle_message(event)
+
+    def _should_chime_in(self, target: str) -> bool:
+        """Probability + per-channel cooldown gate for spontaneous replies."""
+        if not self.cfg.observe_mode or self.cfg.spontaneous_probability <= 0:
+            return False
+        now = time.monotonic()
+        last = self._last_spontaneous.get(target.lower(), 0.0)
+        if now - last < self.cfg.spontaneous_cooldown:
+            return False
+        if secrets.SystemRandom().random() >= self.cfg.spontaneous_probability:
+            return False
+        self._last_spontaneous[target.lower()] = now
+        return True
+
+    # ---- outbound (BasePlatformAdapter contract) -------------------------
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not self._client or not self.is_connected:
+            return SendResult(success=False, error="Not connected", retryable=True)
+        if any(ch in chat_id for ch in ("\r", "\n", "\x00", " ")):
+            return SendResult(success=False, error="Illegal characters in chat_id")
+
+        # Observe-mode silence opt-out: the agent declined to contribute.
+        if content.strip() in ("<silent>", "&lt;silent&gt;"):
+            return SendResult(success=True, message_id="silent")
+
+        lines = split_message(
+            content, chat_id, self.cfg.max_message_length,
+            convert_formatting=self.cfg.convert_formatting,
+        )
+        if not lines:
+            return SendResult(success=False, error="Empty message after formatting")
+
+        try:
+            for i, line in enumerate(lines):
+                self._client.privmsg(chat_id, line, reply_to=reply_to if i == 0 else None)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+        # Keep our own replies in the rolling context (echo-message would
+        # otherwise be filtered out as self).
+        if self._client.is_channel(chat_id):
+            self._record_line(chat_id, self._client.current_nick, " ".join(lines))
+
+        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+
+    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
+        if self._client and self.is_connected:
+            try:
+                self._client.send_typing(chat_id, "active")
+            except Exception:
+                pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        if self._client and self.is_connected:
+            try:
+                self._client.send_typing(chat_id, "done")
+            except Exception:
+                pass
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        is_channel = self._client.is_channel(chat_id) if self._client else chat_id[:1] in "#&+!"
+        info: Dict[str, Any] = {"name": chat_id, "type": "group" if is_channel else "dm"}
+        if self._client and is_channel:
+            try:
+                channel = self._client.server.channels.get(self._client.casefold(chat_id))
+                if channel is not None:
+                    info["topic"] = getattr(channel, "topic", None)
+                    info["user_count"] = len(getattr(channel, "users", {}) or {})
+            except Exception:
+                pass
+        return info
+
+    def format_message(self, content: str) -> str:
+        return markdown_to_irc(content) if self.cfg.convert_formatting else strip_markdown(content)
+
+    # ---- runtime agency, driven by agent tools (Feature B) ---------------
+
+    def _join_allowed(self, channel: str) -> Optional[str]:
+        """Return an error string if joining *channel* isn't permitted."""
+        if not self.cfg.allow_agent_join:
+            return "agent JOIN/PART is disabled (set IRCX_ALLOW_AGENT_JOIN=true to enable)"
+        if not channel or channel[0] not in "#&+!":
+            return f"invalid channel name: {channel!r}"
+        if any(c in channel for c in ("\r", "\n", "\x00", " ")):
+            return "channel name contains illegal characters"
+        if self.cfg.joinable_channels:
+            allowed = {c.lower() for c in self.cfg.joinable_channels}
+            if channel.lower() not in allowed:
+                return f"{channel} is not in the IRCX_JOINABLE_CHANNELS allowlist"
+        return None
+
+    async def runtime_join(self, channel: str, key: Optional[str] = None) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        err = self._join_allowed(channel)
+        if err:
+            return {"error": err}
+        # Persist so the channel is rejoined automatically after a reconnect.
+        if not any(self._client.casefold(c.name) == self._client.casefold(channel) for c in self.cfg.channels):
+            self.cfg.channels.append(ChannelSpec(name=channel, key=key))
+        self._client.join(channel, key)
+        return {"success": True, "joined": channel}
+
+    async def runtime_part(self, channel: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not self.cfg.allow_agent_join:
+            return {"error": "agent JOIN/PART is disabled (set IRCX_ALLOW_AGENT_JOIN=true)"}
+        self.cfg.channels = [c for c in self.cfg.channels
+                             if self._client.casefold(c.name) != self._client.casefold(channel)]
+        self._client.part(channel, reason)
+        return {"success": True, "parted": channel}
+
+    async def runtime_say(self, target: str, text: str) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not target or any(c in target for c in ("\r", "\n", "\x00", " ")):
+            return {"error": "invalid target"}
+        # Only speak into channels we have actually joined, or to a nick (DM).
+        if target[0] in "#&+!" and not self._client.in_channel(target):
+            return {"error": f"not in channel {target} (join it first)"}
+        res = await self.send(target, text)
+        return {"success": True, "target": target} if res.success else {"error": res.error}
+
+    def runtime_list(self) -> Dict[str, Any]:
+        if not self._client:
+            return {"channels": []}
+        return {"channels": self._client.joined_channels(), "nick": self._client.current_nick}
+
+
+# ===========================================================================
+# Plugin module-level hooks
+# ===========================================================================
+
+def _live_ircx_adapter() -> Optional["IRCXAdapter"]:
+    """Fetch the running IRCXAdapter from the in-process gateway, if any."""
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return None
+        return runner.adapters.get(Platform("ircx"))
+    except Exception:
+        return None
+
+
+def _ircx_join_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    channel = str(args.get("channel", "")).strip()
+    key = args.get("key") or None
+    res = _run_coro(adapter.runtime_join(channel, key))
+    return json.dumps(res)
+
+
+def _ircx_part_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_coro(adapter.runtime_part(str(args.get("channel", "")).strip(), args.get("reason")))
+    return json.dumps(res)
+
+
+def _ircx_say_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_coro(adapter.runtime_say(str(args.get("target", "")).strip(), str(args.get("text", ""))))
+    return json.dumps(res)
+
+
+def _ircx_list_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    return json.dumps(adapter.runtime_list())
+
+
+def _run_coro(coro):
+    """Run *coro* to completion from a (possibly sync) tool handler."""
+    import asyncio as _asyncio
+    try:
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        # Called from within the event loop (is_async path) — schedule and wait.
+        fut = _asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=30)
+    return _asyncio.run(coro)
+
+
+_IRCX_TOOL_SCHEMAS = {
+    "irc_join": {
+        "name": "irc_join",
+        "description": (
+            "Join an IRC channel at runtime (requires operator opt-in via "
+            "IRCX_ALLOW_AGENT_JOIN). The bot stays in the channel and rejoins "
+            "after reconnects."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel, e.g. #help"},
+                "key": {"type": "string", "description": "Optional channel key/password"},
+            },
+            "required": ["channel"],
+        },
+    },
+    "irc_part": {
+        "name": "irc_part",
+        "description": "Leave an IRC channel the bot has joined (requires IRCX_ALLOW_AGENT_JOIN).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string"},
+                "reason": {"type": "string", "description": "Optional part message"},
+            },
+            "required": ["channel"],
+        },
+    },
+    "irc_say": {
+        "name": "irc_say",
+        "description": (
+            "Send a message to an IRC channel the bot is in, or a direct "
+            "message to a nick. Use to proactively speak in a specific channel."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Channel (#x) or nick"},
+                "text": {"type": "string"},
+            },
+            "required": ["target", "text"],
+        },
+    },
+    "irc_list_channels": {
+        "name": "irc_list_channels",
+        "description": "List the IRC channels the bot is currently in, and its nick.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+def check_requirements() -> bool:
+    """Dependencies present and minimally configured?"""
+    if not _LIBS_OK:
+        return False
+    server = _env("IRCX_SERVER", "IRC_SERVER")
+    channel = _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+    return bool(server and channel)
+
+
+def validate_config(config: Any) -> bool:
+    if not _LIBS_OK:
+        return False
+    cfg = load_config(config)
+    return bool(cfg.server and cfg.channels)
+
+
+def is_connected(config: Any) -> bool:
+    extra = getattr(config, "extra", {}) or {}
+    server = _env("IRCX_SERVER", "IRC_SERVER") or extra.get("server")
+    channel = (
+        _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+        or extra.get("channels") or extra.get("channel")
+    )
+    return bool(server and channel)
+
+
+def _env_enablement() -> Optional[dict]:
+    """Seed PlatformConfig.extra from env vars before adapter construction."""
+    server = _env("IRCX_SERVER", "IRC_SERVER")
+    channel = _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+    if not (server and channel):
+        return None
+    seed: dict = {"server": server, "channel": channel}
+    port = _env("IRCX_PORT", "IRC_PORT")
+    if port:
+        try:
+            seed["port"] = int(port)
+        except ValueError:
+            pass
+    nickname = _env("IRCX_NICKNAME", "IRC_NICKNAME")
+    if nickname:
+        seed["nickname"] = nickname
+    use_tls = _env("IRCX_USE_TLS", "IRC_USE_TLS", "IRC_TLS")
+    if use_tls is not None:
+        seed["use_tls"] = _truthy(use_tls)
+    home = _env("IRCX_HOME_CHANNEL", "IRC_HOME_CHANNEL") or channel.split(",")[0].strip()
+    if home:
+        seed["home_channel"] = {"chat_id": home, "name": home}
+    return seed
+
+
+async def _standalone_send(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Out-of-process delivery for cron jobs (no live gateway adapter).
+
+    Opens an ephemeral connection with a ``-cron`` nick suffix, joins the
+    target channel, sends, and quits.
+    """
+    if not _LIBS_OK:
+        return {"error": f"IRCX standalone send: {INSTALL_HINT}"}
+    cfg = load_config(pconfig)
+    if not cfg.server:
+        return {"error": "IRCX standalone send: server not configured"}
+    target = chat_id or (cfg.home_channel or "")
+    if not target:
+        return {"error": "IRCX standalone send: no target"}
+    if any(ch in target for ch in ("\r", "\n", "\x00", " ")):
+        return {"error": "IRCX standalone send: illegal characters in target"}
+
+    # Only join + send to channels; DMs go straight to the nick.
+    join_target = target if (target[:1] in "#&+!") else None
+    # Make the cron client a configured channel so allowlist JOIN works.
+    if join_target and not any(c.name.lower() == join_target.lower() for c in cfg.channels):
+        cfg.channels.append(ChannelSpec(name=join_target))
+
+    client = IRCClient(cfg, on_message=_noop_message, nick_suffix="-cron")
+    try:
+        await client.connect(timeout=20.0)
+    except Exception as exc:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return {"error": f"IRCX standalone connect failed: {exc}"}
+
+    try:
+        for line in split_message(message, target, cfg.max_message_length, convert_formatting=cfg.convert_formatting):
+            client.privmsg(target, line)
+        await asyncio.sleep(0.5 * max(1, len(message) // 400 + 1))
+        return {"success": True, "message_id": str(int(time.time() * 1000))}
+    except Exception as exc:
+        return {"error": f"IRCX standalone send failed: {exc}"}
+    finally:
+        await client.disconnect("delivered")
+
+
+async def _noop_message(_msg: Dict[str, Any]) -> None:
+    return None
+
+
+def interactive_setup() -> None:
+    """Interactive ``hermes gateway setup`` flow for IRCX."""
+    from hermes_cli.setup import (
+        prompt, prompt_yes_no, save_env_value, get_env_value,
+        print_header, print_info, print_warning, print_success,
+    )
+
+    print_header("IRC (IRCX)")
+    if not _LIBS_OK:
+        print_warning(f"IRCv3 libraries missing. Run: {INSTALL_HINT}")
+    existing = get_env_value("IRCX_SERVER") or get_env_value("IRC_SERVER")
+    if existing:
+        print_info(f"IRCX: already configured (server: {existing})")
+        if not prompt_yes_no("Reconfigure IRCX?", False):
+            return
+
+    print_info("Production IRCv3 gateway. SASL-capable, multi-channel, account-verified auth.")
+    server = prompt("IRC server hostname (e.g. irc.libera.chat)", default=existing or "")
+    if not server:
+        print_warning("Server is required — skipping IRCX setup")
+        return
+    save_env_value("IRCX_SERVER", server.strip())
+
+    use_tls = prompt_yes_no("Use TLS (recommended)?", True)
+    save_env_value("IRCX_USE_TLS", "true" if use_tls else "false")
+    default_port = "6697" if use_tls else "6667"
+    port = prompt(f"Port (default {default_port})", default=get_env_value("IRCX_PORT") or "")
+    if port:
+        try:
+            save_env_value("IRCX_PORT", str(int(port)))
+        except ValueError:
+            print_warning(f"Invalid port — using default {default_port}")
+
+    nickname = prompt("Bot nickname (e.g. hermes-bot)", default=get_env_value("IRCX_NICKNAME") or "")
+    if not nickname:
+        print_warning("Nickname is required — skipping IRCX setup")
+        return
+    save_env_value("IRCX_NICKNAME", nickname.strip())
+
+    channel = prompt("Channel(s) to join (comma-separated, '#chan key' for keyed)",
+                     default=get_env_value("IRCX_CHANNEL") or "")
+    if not channel:
+        print_warning("Channel is required — skipping IRCX setup")
+        return
+    save_env_value("IRCX_CHANNEL", channel.strip())
+
+    print()
+    print_info("🔑 Authentication (SASL preferred over NickServ)")
+    if prompt_yes_no("Configure SASL?", False):
+        mech = prompt("Mechanism (PLAIN/EXTERNAL/SCRAM-SHA-256)", default="PLAIN") or "PLAIN"
+        save_env_value("IRCX_SASL_MECHANISM", mech.strip().upper())
+        if mech.strip().upper() != "EXTERNAL":
+            sasl_user = prompt("SASL username (account)", default=nickname.strip())
+            if sasl_user:
+                save_env_value("IRCX_SASL_USERNAME", sasl_user.strip())
+            sasl_pw = prompt("SASL password", password=True)
+            if sasl_pw:
+                save_env_value("IRCX_SASL_PASSWORD", sasl_pw)
+    elif prompt_yes_no("Identify with NickServ on connect?", False):
+        ns = prompt("NickServ password", password=True)
+        if ns:
+            save_env_value("IRCX_NICKSERV_PASSWORD", ns)
+
+    print()
+    print_info("🔒 Access control")
+    print_info("   By default only network-verified accounts are authorized.")
+    if prompt_yes_no("Allow all users (dev only)?", False):
+        save_env_value("IRCX_ALLOW_ALL_USERS", "true")
+        print_warning("⚠️  Open access — anyone may command the bot.")
+    else:
+        save_env_value("IRCX_ALLOW_ALL_USERS", "false")
+        allowed = prompt("Allowed accounts/nicks (comma-separated)",
+                         default=get_env_value("IRCX_ALLOWED_USERS") or "")
+        save_env_value("IRCX_ALLOWED_USERS", allowed.replace(" ", "") if allowed else "")
+
+    print()
+    print_success("IRCX configuration saved to ~/.hermes/.env")
+    print_info("Restart the gateway: hermes gateway restart")
+
+
+def register(ctx: Any) -> None:
+    """Plugin entry point — called by the Hermes plugin system."""
+    ctx.register_platform(
+        name="ircx",
+        label="IRC",
+        adapter_factory=lambda cfg: IRCXAdapter(cfg),
+        check_fn=check_requirements,
+        validate_config=validate_config,
+        is_connected=is_connected,
+        required_env=["IRCX_SERVER", "IRCX_CHANNEL", "IRCX_NICKNAME"],
+        install_hint=INSTALL_HINT,
+        setup_fn=interactive_setup,
+        env_enablement_fn=_env_enablement,
+        cron_deliver_env_var="IRCX_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
+        allowed_users_env="IRCX_ALLOWED_USERS",
+        allow_all_env="IRCX_ALLOW_ALL_USERS",
+        max_message_length=450,
+        emoji="💬",
+        pii_safe=False,
+        allow_update_command=True,
+        platform_hint=(
+            "You are chatting via IRC. IRC does not support markdown rendering "
+            "— use plain text. Long messages are automatically split into "
+            "~450-character lines. In channels users address you by prefixing "
+            "your nick. Keep responses concise and conversational. You have "
+            "irc_join / irc_part / irc_say / irc_list_channels tools to manage "
+            "channels when permitted; only join channels when explicitly asked."
+        ),
+    )
+
+    # Runtime agency tools (Feature B).  Registered under the ``ircx`` toolset;
+    # enable it for the platform (platform_toolsets.ircx) to expose them.
+    _register = getattr(ctx, "register_tool", None)
+    if callable(_register):
+        for _name, _handler in (
+            ("irc_join", _ircx_join_tool),
+            ("irc_part", _ircx_part_tool),
+            ("irc_say", _ircx_say_tool),
+            ("irc_list_channels", _ircx_list_tool),
+        ):
+            try:
+                _register(
+                    name=_name,
+                    toolset="ircx",
+                    schema=_IRCX_TOOL_SCHEMAS[_name],
+                    handler=_handler,
+                    description=_IRCX_TOOL_SCHEMAS[_name]["description"],
+                    emoji="💬",
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.debug("IRCX: could not register tool %s: %s", _name, exc)

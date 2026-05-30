@@ -1,0 +1,151 @@
+name: ircx-platform
+label: IRC
+kind: platform
+version: 1.0.0
+description: >
+  Production IRCv3 gateway adapter for Hermes Agent.  Connects to one or
+  more IRC channels (and DMs) and relays messages to/from the Hermes agent.
+  Built on the irctokens + ircstates IRCv3 stack: full capability
+  negotiation, SASL (PLAIN / EXTERNAL / SCRAM-SHA-256), server-time,
+  account-tag / extended-join verified-account authorization, message
+  tags, echo-message, typing notifications, multi-channel, channel keys,
+  ISUPPORT-aware message splitting and casemapping, CTCP, flood
+  protection and keepalive ping-timeout detection.  Feature-parity with
+  the OpenClaw IRC channel (groupPolicy / allowFrom / requireMention /
+  per-channel tool scoping) and then some.
+author: computator1200 (community)
+# ``requires_env`` / ``optional_env`` entries surface in the
+# ``hermes config`` UI via the platform-plugin env var injector.
+#
+# All variables use the IRCX_ prefix.  For drop-in compatibility with the
+# bundled stdlib ``irc`` example plugin, every IRCX_ variable also falls
+# back to its IRC_ equivalent when unset (e.g. IRCX_SERVER -> IRC_SERVER).
+requires_env:
+  - name: IRCX_SERVER
+    description: "IRC server hostname (e.g. irc.libera.chat). Falls back to IRC_SERVER."
+    prompt: "IRC server"
+    password: false
+  - name: IRCX_CHANNEL
+    description: "Channel(s) to join, comma-separated. A key may follow a space (e.g. '#ops secret'). Falls back to IRC_CHANNEL."
+    prompt: "IRC channel(s)"
+    password: false
+  - name: IRCX_NICKNAME
+    description: "Bot nickname on IRC (default: hermes-bot). Falls back to IRC_NICKNAME."
+    prompt: "Bot nickname"
+    password: false
+optional_env:
+  - name: IRCX_PORT
+    description: "IRC server port (default: 6697 with TLS, 6667 without). Falls back to IRC_PORT."
+    prompt: "IRC port"
+    password: false
+  - name: IRCX_USE_TLS
+    description: "Use TLS (1/true/yes). Default: true. Falls back to IRC_USE_TLS / IRC_TLS."
+    prompt: "Use TLS? (true/false)"
+    password: false
+  - name: IRCX_TLS_VERIFY
+    description: "Verify the server TLS certificate (default: true). Set false only for self-signed test servers."
+    prompt: "Verify TLS cert? (true/false)"
+    password: false
+  - name: IRCX_USERNAME
+    description: "IRC ident/username (default: nickname). Falls back to IRC_USERNAME."
+    prompt: "IRC username/ident"
+    password: false
+  - name: IRCX_REALNAME
+    description: "IRC realname / gecos (default: 'Hermes Agent'). Falls back to IRC_REALNAME."
+    prompt: "IRC realname"
+    password: false
+  - name: IRCX_SERVER_PASSWORD
+    description: "Server password for the PASS command (optional). Falls back to IRC_SERVER_PASSWORD / IRC_PASSWORD."
+    prompt: "Server password (optional)"
+    password: true
+  - name: IRCX_SASL_MECHANISM
+    description: "SASL mechanism: PLAIN, EXTERNAL, or SCRAM-SHA-256 (optional, recommended over NickServ)."
+    prompt: "SASL mechanism (PLAIN/EXTERNAL/SCRAM-SHA-256)"
+    password: false
+  - name: IRCX_SASL_USERNAME
+    description: "SASL account name (defaults to nickname)."
+    prompt: "SASL username"
+    password: false
+  - name: IRCX_SASL_PASSWORD
+    description: "SASL password (for PLAIN / SCRAM-SHA-256)."
+    prompt: "SASL password"
+    password: true
+  - name: IRCX_TLS_CLIENT_CERT
+    description: "Path to TLS client certificate (PEM) for SASL EXTERNAL / CertFP."
+    prompt: "TLS client cert path"
+    password: false
+  - name: IRCX_TLS_CLIENT_KEY
+    description: "Path to TLS client private key (PEM) for SASL EXTERNAL / CertFP (default: same file as cert)."
+    prompt: "TLS client key path"
+    password: false
+  - name: IRCX_NICKSERV_PASSWORD
+    description: "NickServ password for automatic IDENTIFY on connect (optional; prefer SASL). Falls back to IRC_NICKSERV_PASSWORD."
+    prompt: "NickServ password (optional)"
+    password: true
+  - name: IRCX_NICKSERV_SERVICE
+    description: "NickServ service nick to message (default: NickServ)."
+    prompt: "NickServ service nick"
+    password: false
+  - name: IRCX_ALLOWED_USERS
+    description: "Comma-separated IRC accounts (or nicks) allowed to talk to the bot. Falls back to IRC_ALLOWED_USERS."
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: IRCX_ALLOW_ALL_USERS
+    description: "Allow anyone to talk to the bot (dev only). Falls back to IRC_ALLOW_ALL_USERS."
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: IRCX_DANGEROUSLY_ALLOW_NAME_MATCHING
+    description: "Authorize by bare nickname instead of verified NickServ account. Insecure: anyone can claim a nick. Default: false."
+    prompt: "Allow bare-nick auth? (true/false)"
+    password: false
+  - name: IRCX_REQUIRE_MENTION
+    description: "In channels, only respond when the bot is addressed (default: true). Set false to respond to all channel messages."
+    prompt: "Require mention in channels? (true/false)"
+    password: false
+  - name: IRCX_GROUP_POLICY
+    description: "Channel access policy: 'allowlist' (only joined/listed channels) or 'open' (any channel). Default: allowlist."
+    prompt: "Group policy (allowlist/open)"
+    password: false
+  - name: IRCX_HOME_CHANNEL
+    description: "Channel for cron / notification delivery (defaults to first IRCX_CHANNEL). Falls back to IRC_HOME_CHANNEL."
+    prompt: "Home channel (or empty)"
+    password: false
+  - name: IRCX_MAX_MESSAGE_LENGTH
+    description: "Max bytes of message content per IRC line before splitting (default: 450)."
+    prompt: "Max message length"
+    password: false
+  # ── Observe mode / spontaneous contribution ──
+  - name: IRCX_OBSERVE_MODE
+    description: "Observe channel chatter and optionally chime in unprompted (default: false)."
+    prompt: "Observe mode? (true/false)"
+    password: false
+  - name: IRCX_SPONTANEOUS_PROBABILITY
+    description: "0..1 chance to spontaneously contribute to an unaddressed message (observe mode). Default: 0."
+    prompt: "Spontaneous reply probability (0-1)"
+    password: false
+  - name: IRCX_SPONTANEOUS_COOLDOWN
+    description: "Minimum seconds between spontaneous posts per channel (default: 90)."
+    prompt: "Spontaneous cooldown (seconds)"
+    password: false
+  - name: IRCX_CONTEXT_BUFFER
+    description: "Recent channel lines kept per channel for context injection (default: 15)."
+    prompt: "Context buffer size"
+    password: false
+  # ── Runtime channel agency (agent tools) ──
+  - name: IRCX_ALLOW_AGENT_JOIN
+    description: "Allow the agent to JOIN/PART channels at runtime via irc_join/irc_part tools (default: false)."
+    prompt: "Allow agent to join/part? (true/false)"
+    password: false
+  - name: IRCX_JOINABLE_CHANNELS
+    description: "Comma-separated allowlist of channels the agent may join (empty = any, when agent-join is enabled)."
+    prompt: "Joinable channels (comma-separated)"
+    password: false
+  # ── Context persistence across disconnects ──
+  - name: IRCX_LOG_DIR
+    description: "Directory to log channel lines to; on (re)join the tail is replayed as context. Empty = disabled."
+    prompt: "IRC log directory (or empty)"
+    password: false
+  - name: IRCX_CHATHISTORY_LIMIT
+    description: "How many backlog messages to fetch via IRCv3 draft/chathistory on (re)join, where supported (default: 50)."
+    prompt: "Chathistory fetch size"
+    password: false

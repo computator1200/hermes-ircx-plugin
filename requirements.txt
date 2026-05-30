@@ -1,0 +1,5 @@
+# IRCX plugin runtime dependencies (pure-Python, no C build).
+# Install into the same environment your Hermes gateway runs from, e.g.:
+#   <hermes-venv>/bin/python -m pip install -r requirements.txt
+irctokens>=2.0
+ircstates>=0.13
