@@ -1531,8 +1531,11 @@ class IRCXAdapter(BasePlatformAdapter):
         if not self.cfg.observe_mode or self.cfg.spontaneous_probability <= 0:
             return False
         now = time.monotonic()
-        last = self._last_spontaneous.get(target.lower(), 0.0)
-        if now - last < self.cfg.spontaneous_cooldown:
+        last = self._last_spontaneous.get(target.lower())
+        # Only apply the cooldown once we've actually posted before. Using a
+        # 0.0 sentinel was unsafe: time.monotonic() can be small on a freshly
+        # booted host, wrongly blocking the very first spontaneous message.
+        if last is not None and (now - last) < self.cfg.spontaneous_cooldown:
             return False
         if secrets.SystemRandom().random() >= self.cfg.spontaneous_probability:
             return False
