@@ -1,65 +1,146 @@
-# hermes-ircx-plugin
+<!-- Banner -->
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=12,20,30&height=210&section=header&text=IRCX&fontSize=82&fontColor=ffffff&desc=Production%20IRCv3%20adapter%20for%20Hermes%20Agent&descAlignY=72&descSize=20" alt="IRCX banner" />
+</p>
 
-A **production IRCv3 platform adapter** for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — connect your Hermes agent to IRC channels and DMs with full IRCv3 support.
+<!-- Badges / stickers -->
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3DA639?style=for-the-badge" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/IRCv3-supported-5865F2?style=for-the-badge" alt="IRCv3">
+  <img src="https://img.shields.io/badge/SASL-PLAIN·EXTERNAL·SCRAM-E8590C?style=for-the-badge" alt="SASL">
+  <img src="https://img.shields.io/badge/tests-91%20passing-2EA043?style=for-the-badge&logo=pytest&logoColor=white" alt="91 tests passing">
+  <img src="https://img.shields.io/badge/built%20for-Hermes%20Agent-7C3AED?style=for-the-badge" alt="Built for Hermes Agent">
+</p>
 
-Built on the [`irctokens`](https://pypi.org/project/irctokens/) + [`ircstates`](https://pypi.org/project/ircstates/) stack (the de-facto correct, sans-IO IRCv3 parsing/state libraries). This is a feature superset of the stdlib `irc` example that ships with Hermes, and reaches parity with (and beyond) the OpenClaw IRC channel.
+<!-- Button-style nav -->
+<p align="center">
+  <a href="#-install"><img src="https://img.shields.io/badge/▶_Install-2EA043?style=for-the-badge" alt="Install"></a>
+  <a href="#-features"><img src="https://img.shields.io/badge/✦_Features-1F6FEB?style=for-the-badge" alt="Features"></a>
+  <a href="plugins/platforms/ircx/plugin.yaml"><img src="https://img.shields.io/badge/⚙_Config-6E7681?style=for-the-badge" alt="Config"></a>
+  <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Nous_Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://github.com/computator1200/hermes-ircx-plugin/stargazers"><img src="https://img.shields.io/github/stars/computator1200/hermes-ircx-plugin?style=for-the-badge&logo=github&color=F1E05A&logoColor=white" alt="Stars"></a>
+</p>
 
-> Platform name: **`ircx`**. It coexists with the bundled `irc` example, so you can run both side-by-side and switch over when ready.
+<p align="center">
+  <b>Connect your <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a> to IRC</b> — channels and DMs — with a full, modern IRCv3 stack.<br>
+  <sub>A feature superset of the stdlib <code>irc</code> example Hermes ships with, and then some. 💬</sub>
+</p>
 
-## Features
+---
 
-- **IRCv3 capability negotiation** (`CAP LS 302` → `REQ` → `END`), only using ACKed caps.
-- **SASL**: `PLAIN`, `EXTERNAL` (CertFP), `SCRAM-SHA-256`, `SCRAM-SHA-512`. NickServ `IDENTIFY` fallback.
-- **Verified-account authorization** via `account-tag` / `extended-join` — authorize by the network-verified account, not the spoofable nick (bare-nick auth is opt-in).
-- **Multi-channel**, channel keys, server password, ISUPPORT-aware casemapping + message splitting, CTCP, flood protection, keepalive + ping-timeout, and gateway-driven reconnect (rejoins + re-auths).
-- **Message tags**: `server-time`, `msgid`, `+draft/reply` threaded replies, `+typing` notifications.
-- **OpenClaw parity**: `group_policy`, per-channel `groups` (`require_mention` / `allow_from` / `tools` / `tools_by_sender`), DM allowlists.
-- **Interactive agent behaviours**:
-  - *Observe mode* — keeps rolling channel context and can spontaneously contribute (probability + cooldown gated); declines with `<silent>`.
-  - *Runtime channel agency* — `irc_join` / `irc_part` / `irc_say` / `irc_list_channels` tools, gated behind `IRCX_ALLOW_AGENT_JOIN` + a `joinable_channels` allowlist.
-  - *Downtime context persistence* — IRCv3 `draft/chathistory` backfill on (re)join, plus optional on-disk channel logging with tail-replay (and works great behind a ZNC/soju bouncer).
+## 🛰️ Why IRCX?
 
-See [`plugins/platforms/ircx/README.md`](plugins/platforms/ircx/README.md) for the full feature + behaviour reference, and [`plugins/platforms/ircx/plugin.yaml`](plugins/platforms/ircx/plugin.yaml) for every config/env var.
+Hermes ships only a minimal stdlib `irc` **example**. **IRCX** is the production-grade alternative — built on the de-facto-correct [`irctokens`](https://pypi.org/project/irctokens/) + [`ircstates`](https://pypi.org/project/ircstates/) IRCv3 libraries — that turns your agent into a real channel citizen: it authenticates properly, remembers conversations across disconnects, can manage its own channels on request, and can even chime into the conversation on its own.
 
-## Install
+> **Platform name:** `ircx` — coexists with the bundled `irc` example, so you can run both side-by-side and switch when ready.
 
-**1. Dependencies** — install into the environment your Hermes gateway runs from:
+---
+
+## ✦ Features
+
+| | Capability |
+|---|---|
+| 🤝 | **IRCv3 capability negotiation** — `CAP LS 302 → REQ → END`, only ACKed caps used |
+| 🔐 | **SASL** — `PLAIN`, `EXTERNAL` (CertFP), `SCRAM-SHA-256`, `SCRAM-SHA-512` (+ NickServ fallback) |
+| 🪪 | **Verified-account auth** — authorize by network account (`account-tag` / `extended-join`), *not* the spoofable nick. Bare-nick auth is opt-in |
+| 🏷️ | **Message tags** — `server-time`, `msgid`, `+draft/reply` threaded replies, `+typing` notifications |
+| 📡 | **Robust transport** — multi-channel, channel keys, flood protection, keepalive + ping-timeout, gateway-driven reconnect (rejoins + re-auths) |
+| 🧭 | **ISUPPORT-aware** — casemapping, `CHANTYPES`, byte-accurate message splitting; CTCP `VERSION`/`PING`/`TIME`/`ACTION` |
+| 🛡️ | **OpenClaw parity** — `group_policy`, per-channel `groups` (`require_mention` / `allow_from` / `tools` / `tools_by_sender`), DM allowlists |
+
+### 🎭 Interactive agent behaviours
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+**👀 Observe mode**
+
+Keeps rolling channel context and may *spontaneously* contribute to the conversation — probability- and cooldown-gated. Declines gracefully with `<silent>`.
+
+</td>
+<td width="33%" valign="top">
+
+**🛠️ Channel agency**
+
+`irc_join` · `irc_part` · `irc_say` · `irc_list_channels` tools let the agent manage channels on request — gated behind an opt-in flag + allowlist.
+
+</td>
+<td width="33%" valign="top">
+
+**💾 Context persistence**
+
+IRCv3 `draft/chathistory` backfill on (re)join, plus optional on-disk logging with tail-replay. Pairs perfectly with a ZNC/soju bouncer.
+
+</td>
+</tr>
+</table>
+
+---
+
+## ▶ Install
+
+**1 · Dependencies** (into the env your Hermes gateway runs from):
 
 ```bash
 <hermes-venv>/bin/python -m pip install irctokens ircstates
 ```
 
-**2. Drop in the plugin** — two equivalent options:
+**2 · Drop in the plugin** — either works:
 
 ```bash
-# (a) As a user plugin
-cp -r plugins/platforms/ircx ~/.hermes/plugins/ircx
-
-# (b) As a bundled platform (inside a hermes-agent checkout)
+cp -r plugins/platforms/ircx ~/.hermes/plugins/ircx            # as a user plugin
+# or, inside a hermes-agent checkout:
 cp -r plugins/platforms/ircx <hermes-agent>/plugins/platforms/ircx
 ```
 
-**3. Configure** (env vars in `~/.hermes/.env`, or `config.yaml` under `gateway.platforms.ircx.extra`):
+**3 · Configure** (env in `~/.hermes/.env`, or `config.yaml` → `gateway.platforms.ircx.extra`):
 
 ```bash
 IRCX_SERVER=irc.libera.chat
 IRCX_CHANNEL=#yourchannel
 IRCX_NICKNAME=hermes-bot
 IRCX_SASL_MECHANISM=PLAIN
-IRCX_SASL_USERNAME=...
-IRCX_SASL_PASSWORD=...
-IRCX_ALLOWED_USERS=youraccount          # verified accounts allowed to command the bot
+IRCX_SASL_USERNAME=hermes
+IRCX_SASL_PASSWORD=••••••••
+IRCX_ALLOWED_USERS=youraccount       # verified accounts allowed to command the bot
 ```
 
-Then restart the gateway. Every `IRCX_*` variable also falls back to the legacy `IRC_*` name, so existing example-plugin setups work unchanged.
+Restart the gateway and you're live. Every `IRCX_*` var falls back to the legacy `IRC_*` name, so existing example-plugin setups work unchanged.
 
-## Optional: per-channel tool scoping (requires a small core patch)
+<details>
+<summary><b>🎚️ Optional: enable the interactive behaviours</b></summary>
 
-`groups.<chan>.tools` / `tools_by_sender` (toolset-level scoping) is enforced via a tiny, generic, backward-compatible core hook documented in [`CORE_PATCH.md`](CORE_PATCH.md). Without that patch the plugin still works — the scope is simply ignored. The patch is a good candidate to upstream to Hermes.
+```bash
+# Observe mode — occasionally chime in on unaddressed chatter
+IRCX_OBSERVE_MODE=true
+IRCX_SPONTANEOUS_PROBABILITY=0.15      # 0..1
+IRCX_SPONTANEOUS_COOLDOWN=90           # seconds between spontaneous posts/channel
 
-## Tests
+# Runtime channel agency (agent can join/part/say on request)
+IRCX_ALLOW_AGENT_JOIN=true
+IRCX_JOINABLE_CHANNELS=#ops,#help      # allowlist; empty = any
 
-`tests/` are written against the Hermes test harness. Run them from inside a `hermes-agent` checkout that has this plugin installed at `plugins/platforms/ircx/`:
+# Downtime context persistence
+IRCX_LOG_DIR=~/.hermes/logs/ircx       # log + replay channel tail on (re)join
+IRCX_CHATHISTORY_LIMIT=50              # IRCv3 draft/chathistory backfill size
+```
+
+See [`plugins/platforms/ircx/plugin.yaml`](plugins/platforms/ircx/plugin.yaml) for **every** option, and the [plugin README](plugins/platforms/ircx/README.md) for the full behaviour reference.
+</details>
+
+---
+
+## 🧩 Optional: per-channel tool scoping
+
+`groups.<chan>.tools` / `tools_by_sender` (toolset-level scoping) is enforced via a tiny, generic, backward-compatible core hook — documented in [`CORE_PATCH.md`](CORE_PATCH.md). Without the patch the plugin still works; the scope is simply ignored. It's a clean candidate to upstream into Hermes.
+
+---
+
+## 🧪 Tests
+
+`tests/` run against the Hermes test harness — from inside a `hermes-agent` checkout with the plugin installed at `plugins/platforms/ircx/`:
 
 ```bash
 cp tests/test_ircx_*.py <hermes-agent>/tests/gateway/
@@ -67,12 +148,21 @@ cd <hermes-agent>
 ./venv/bin/python -m pytest tests/gateway/test_ircx_adapter.py tests/gateway/test_ircx_features.py -q
 ```
 
-91 network-free tests cover config, message splitting, the CAP/SASL state machine (incl. SCRAM-256/512 vs a reference server), mention gating, the verified-account authorization matrix, CTCP, observe-mode, the agency tools, and chathistory/logging. The full connect → CAP → registration → JOIN path has also been validated live against Libera.Chat and Rizon.
+**91 network-free tests** cover config, message splitting, the CAP/SASL state machine (incl. SCRAM-256/512 vs a reference server), mention gating, the verified-account authorization matrix, CTCP, observe-mode, the agency tools, and chathistory/logging. The full `connect → CAP → registration → JOIN` path has been validated live on **Libera.Chat** and **Rizon**.
 
-## Status
+---
 
-Working and tested, but young — please file issues / PRs. Not affiliated with or endorsed by Nous Research.
+## 📦 Status
 
-## License
+> ![Status](https://img.shields.io/badge/status-working_&_tested,_young-yellow?style=flat-square) Well-tested and live-validated, but it hasn't had a long production soak yet. Issues and PRs very welcome! 🙌
 
-MIT — see [LICENSE](LICENSE). Built with the Hermes Agent platform-adapter SDK.
+<sub>Not affiliated with or endorsed by Nous Research.</sub>
+
+---
+
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-3DA639?style=flat-square" alt="MIT">
+  &nbsp;·&nbsp; Built with the Hermes Agent platform-adapter SDK
+  &nbsp;·&nbsp; <a href="https://github.com/computator1200/hermes-ircx-plugin/issues">Report a bug</a>
+</p>
+<p align="center"><sub>If IRCX is useful to you, consider leaving a ⭐ — it helps others find it.</sub></p>
