@@ -1205,6 +1205,89 @@ class IRCClient:
             cf = self.casefold(channel)
             return any(self.casefold(c) == cf for c in self.joined_channels())
 
+    def _prefix_for_modes(self, modes) -> str:
+        """Map membership modes (e.g. {'o','v'}) to sigils (@, +) via ISUPPORT PREFIX."""
+        try:
+            pfx = self.server.isupport.prefix
+            order = list(getattr(pfx, "modes", "ov"))
+            sig = list(getattr(pfx, "prefixes", "@+"))
+            mapping = dict(zip(order, sig))
+            for m in order:
+                if modes and m in modes:
+                    return mapping.get(m, "")
+        except Exception:
+            if modes:
+                if "o" in modes:
+                    return "@"
+                if "v" in modes:
+                    return "+"
+        return ""
+
+    def channel_info(self, channel: str) -> Optional[Dict[str, Any]]:
+        """Read membership/ops/voice/topic for a joined channel from ircstates."""
+        try:
+            ch = self.server.channels.get(self.casefold(channel))
+        except Exception:
+            ch = None
+        if ch is None:
+            return None
+        members = []
+        ops = []
+        voiced = []
+        for nick_cf, cu in getattr(ch, "users", {}).items():
+            user = self.server.users.get(nick_cf)
+            nick = user.nickname if user else nick_cf
+            modes = getattr(cu, "modes", set()) or set()
+            sig = self._prefix_for_modes(modes)
+            members.append(f"{sig}{nick}")
+            if "o" in modes:
+                ops.append(nick)
+            elif "v" in modes:
+                voiced.append(nick)
+        members.sort(key=lambda n: (n[:1] not in "@+", n.lstrip("@+%&~").lower()))
+        return {
+            "channel": getattr(ch, "name", channel),
+            "topic": getattr(ch, "topic", None),
+            "topic_setter": getattr(ch, "topic_setter", None),
+            "user_count": len(members),
+            "op_count": len(ops),
+            "voice_count": len(voiced),
+            "ops": ops,
+            "voiced": voiced,
+            "members": members,
+            "channel_modes": sorted(getattr(ch, "modes", {}) or {}),
+        }
+
+    def refresh_names(self, channel: str) -> None:
+        """Ask the server to re-send the NAMES list for a channel."""
+        if self.is_channel(channel):
+            self.send_line("NAMES", [channel])
+
+    def user_info(self, nick: str) -> Optional[Dict[str, Any]]:
+        """Best-effort info about a user already known in shared-channel state."""
+        try:
+            u = self.server.users.get(self.casefold(nick))
+        except Exception:
+            u = None
+        if u is None:
+            return None
+        shared = []
+        try:
+            for ch_cf, ch in self.server.channels.items():
+                if self.casefold(nick) in getattr(ch, "users", {}):
+                    shared.append(getattr(ch, "name", ch_cf))
+        except Exception:
+            pass
+        return {
+            "nick": u.nickname,
+            "username": getattr(u, "username", None),
+            "hostname": getattr(u, "hostname", None),
+            "realname": getattr(u, "realname", None),
+            "account": getattr(u, "account", None),
+            "away": getattr(u, "away", None),
+            "shared_channels": shared,
+        }
+
 
 # ===========================================================================
 # Hermes platform adapter
@@ -1664,6 +1747,33 @@ class IRCXAdapter(BasePlatformAdapter):
             return {"channels": []}
         return {"channels": self._client.joined_channels(), "nick": self._client.current_nick}
 
+    async def runtime_channel_info(self, channel: str) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        target = channel or ""
+        if not target and self.cfg.channels:
+            target = self.cfg.channels[0].name
+        if not target:
+            return {"error": "no channel specified"}
+        if not self._client.is_channel(target):
+            return {"error": f"{target} is not a channel"}
+        if not self._client.in_channel(target):
+            return {"error": f"not in channel {target} (the bot must be a member to see its users)"}
+        info = self._client.channel_info(target)
+        if info is None:
+            return {"error": f"no state for {target} yet — try again in a moment"}
+        return {"success": True, **info}
+
+    async def runtime_whois(self, nick: str) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not nick:
+            return {"error": "no nick specified"}
+        info = self._client.user_info(nick)
+        if info is None:
+            return {"error": f"{nick} is not visible in any channel the bot shares"}
+        return {"success": True, **info}
+
 
 # ===========================================================================
 # Plugin module-level hooks
@@ -1716,6 +1826,24 @@ def _ircx_list_tool(args: dict, **kwargs) -> str:
     if adapter is None:
         return json.dumps({"error": "IRC not connected in this process"})
     return json.dumps(adapter.runtime_list())
+
+
+def _ircx_channel_info_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_coro(adapter.runtime_channel_info(str(args.get("channel", "")).strip()))
+    return json.dumps(res)
+
+
+def _ircx_whois_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_coro(adapter.runtime_whois(str(args.get("nick", "")).strip()))
+    return json.dumps(res)
 
 
 def _run_coro(coro):
@@ -1780,6 +1908,36 @@ _IRCX_TOOL_SCHEMAS = {
         "name": "irc_list_channels",
         "description": "List the IRC channels the bot is currently in, and its nick.",
         "parameters": {"type": "object", "properties": {}},
+    },
+    "irc_channel_info": {
+        "name": "irc_channel_info",
+        "description": (
+            "Get the live roster of a channel the bot is in: the member list "
+            "(with @ for ops and + for voiced), total user count, who the ops "
+            "and voiced users are, and the channel topic. Use this to answer "
+            "'who is here', 'how many users/ops', 'what's the topic', etc."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel name, e.g. #help. Defaults to the bot's primary channel."},
+            },
+        },
+    },
+    "irc_whois": {
+        "name": "irc_whois",
+        "description": (
+            "Look up what the bot knows about a specific IRC user it shares a "
+            "channel with: their nick, ident/host, verified account (if any), "
+            "away status, and which shared channels they're in."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "nick": {"type": "string", "description": "The nickname to look up."},
+            },
+            "required": ["nick"],
+        },
     },
 }
 
@@ -1997,7 +2155,9 @@ def register(ctx: Any) -> None:
             "~450-character lines. In channels users address you by prefixing "
             "your nick. Keep responses concise and conversational. You have "
             "irc_join / irc_part / irc_say / irc_list_channels tools to manage "
-            "channels when permitted; only join channels when explicitly asked."
+            "channels when permitted (only join channels when explicitly asked), "
+            "and irc_channel_info / irc_whois to see who is in a channel, the "
+            "user/op counts, the topic, and details about a specific user."
         ),
     )
 
@@ -2010,6 +2170,8 @@ def register(ctx: Any) -> None:
             ("irc_part", _ircx_part_tool),
             ("irc_say", _ircx_say_tool),
             ("irc_list_channels", _ircx_list_tool),
+            ("irc_channel_info", _ircx_channel_info_tool),
+            ("irc_whois", _ircx_whois_tool),
         ):
             try:
                 _register(

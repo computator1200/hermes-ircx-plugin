@@ -293,3 +293,84 @@ class TestNewConfig:
         from gateway.config import PlatformConfig
         cfg = ircx.load_config(PlatformConfig())
         assert cfg.spontaneous_probability == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Channel introspection: irc_channel_info / irc_whois
+# ---------------------------------------------------------------------------
+
+def _seed_roster(client):
+    """Feed a NAMES + topic burst so ircstates has channel membership/ops."""
+    for raw in [
+        ":srv 001 pascal :hi",
+        ":pascal!u@h JOIN #world-chat",
+        ":srv 353 pascal = #world-chat :pascal @alice +bob carol @dave",
+        ":srv 366 pascal #world-chat :end",
+        ":srv 332 pascal #world-chat :Welcome to World Chat!",
+        ":alice!ali@host1 JOIN #world-chat",
+    ]:
+        for line in client.server.recv((raw + "\r\n").encode()):
+            client.server.parse_tokens(line)
+
+
+class TestChannelInfo:
+    @pytest.mark.asyncio
+    async def test_channel_info_counts_ops_voice_topic(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#world-chat")])
+        _seed_roster(client)
+        adapter._mark_connected()
+        info = await adapter.runtime_channel_info("#world-chat")
+        assert info["success"] is True
+        assert info["channel"] == "#world-chat"
+        assert info["user_count"] == 5
+        assert "dave" in info["ops"]
+        assert info["topic"] == "Welcome to World Chat!"
+        # ops are flagged with @, voiced with + in the member list
+        assert any(m.startswith("@") for m in info["members"])
+
+    @pytest.mark.asyncio
+    async def test_channel_info_defaults_to_primary_channel(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#world-chat")])
+        _seed_roster(client)
+        adapter._mark_connected()
+        info = await adapter.runtime_channel_info("")
+        assert info.get("channel") == "#world-chat"
+
+    @pytest.mark.asyncio
+    async def test_channel_info_not_a_member(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#world-chat")])
+        adapter._mark_connected()
+        res = await adapter.runtime_channel_info("#elsewhere")
+        assert "error" in res
+
+    @pytest.mark.asyncio
+    async def test_whois_known_user(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#world-chat")])
+        _seed_roster(client)
+        adapter._mark_connected()
+        res = await adapter.runtime_whois("alice")
+        assert res["success"] is True
+        assert res["nick"] == "alice"
+        assert "#world-chat" in res["shared_channels"]
+
+    @pytest.mark.asyncio
+    async def test_whois_unknown_user(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#world-chat")])
+        _seed_roster(client)
+        adapter._mark_connected()
+        res = await adapter.runtime_whois("ghost")
+        assert "error" in res
+
+    def test_new_tools_registered(self):
+        captured = []
+
+        class Ctx:
+            def register_platform(self, **kw):
+                pass
+
+            def register_tool(self, **kw):
+                captured.append(kw["name"])
+
+        ircx.register(Ctx())
+        assert "irc_channel_info" in captured
+        assert "irc_whois" in captured
