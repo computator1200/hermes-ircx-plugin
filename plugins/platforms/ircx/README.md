@@ -2,8 +2,9 @@
 
 > **Advanced features** (see "Interactive agent behaviours" below): observe-mode
 > spontaneous contribution, runtime channel-agency tools (`irc_join` / `irc_part`
-> / `irc_say` / `irc_list_channels`), and downtime context persistence
-> (IRCv3 `draft/chathistory` backfill + on-disk channel logging with tail replay).
+> / `irc_say` / `irc_list_channels`), channel introspection (`irc_channel_info`
+> / `irc_whois` — roster, ops, topic, user lookup), and downtime context
+> persistence (IRCv3 `draft/chathistory` backfill + on-disk logging tail replay).
 
 A drop-in gateway platform plugin that connects Hermes to IRC with full
 IRCv3 support. Built on the [`irctokens`](https://pypi.org/project/irctokens/)
@@ -198,6 +199,21 @@ across reconnects. `irc_say` only targets channels the bot is actually in (or a
 nick for a DM). Disabled by default. Env: `IRCX_ALLOW_AGENT_JOIN`,
 `IRCX_JOINABLE_CHANNELS`. Keep `IRCX_ALLOWED_USERS` tight when enabling this so
 only trusted operators can direct joins.
+
+### Channel introspection (agent tools)
+Two **read-only** tools (always available in the `ircx` toolset; no
+`allow_agent_join` required) let the agent answer questions about who's around:
+
+- `irc_channel_info` — the live roster of a channel the bot is in: the member
+  list (`@` for ops, `+` for voiced), total user / op / voice counts, and the
+  topic. Use for "who is here?", "how many ops?", "what's the topic?".
+- `irc_whois` — what the bot knows about a specific user it shares a channel
+  with: nick, ident/host, verified account (if any), away status, and shared
+  channels.
+
+These read directly from the `ircstates` state machine (NAMES/`353`, WHO, MODE,
+TOPIC) — no extra round-trips in the common case. The bot must be a *member* of
+a channel to see its roster.
 
 ### Downtime context persistence
 IRC is stateless, but the **agent's own conversation memory persists** in

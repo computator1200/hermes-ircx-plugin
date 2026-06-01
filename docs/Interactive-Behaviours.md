@@ -38,6 +38,10 @@ Tools (toolset `ircx`; enable it for the platform via `platform_toolsets.ircx`):
 | `irc_part` | Leave a channel. |
 | `irc_say` | Send to a channel the bot is in, or DM a nick. |
 | `irc_list_channels` | List joined channels + current nick. |
+| `irc_channel_info` | Live roster of a channel: member list (`@` ops, `+` voiced), user/op/voice counts, and the topic. Answers "who's here", "how many ops", "what's the topic". |
+| `irc_whois` | What the bot knows about a user it shares a channel with: nick, ident/host, verified account, away status, shared channels. |
+
+> `irc_channel_info` / `irc_whois` are **read-only** (no `allow_agent_join` needed) — they just report what the bot already sees via the IRCv3 state machine (NAMES/WHO/MODE/TOPIC). The bot must be a *member* of a channel to see its roster.
 
 **Security:** because the agent acts for whoever messaged it, keep `IRCX_ALLOWED_USERS` tight when enabling agent-join so only trusted operators can direct joins. `irc_say` only targets channels the bot has actually joined.
 

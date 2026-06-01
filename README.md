@@ -77,7 +77,7 @@ Keeps rolling channel context and may *spontaneously* contribute to the conversa
 
 **🛠️ Channel agency**
 
-`irc_join` · `irc_part` · `irc_say` · `irc_list_channels` tools let the agent manage channels on request — gated behind an opt-in flag + allowlist.
+`irc_join` · `irc_part` · `irc_say` · `irc_list_channels` let the agent manage channels on request (opt-in + allowlist); `irc_channel_info` · `irc_whois` let it see who's in a channel, the op/user counts, the topic, and details about a user.
 
 </td>
 <td width="33%" valign="top">
