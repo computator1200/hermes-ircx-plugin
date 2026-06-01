@@ -374,3 +374,98 @@ class TestChannelInfo:
         ircx.register(Ctx())
         assert "irc_channel_info" in captured
         assert "irc_whois" in captured
+
+
+# ---------------------------------------------------------------------------
+# Audit hardening regressions
+# ---------------------------------------------------------------------------
+
+class TestAuditFixes:
+    def test_send_queue_is_bounded(self):
+        client, _ = make_client()
+        assert client._send_q.maxsize == 512
+
+    @pytest.mark.asyncio
+    async def test_send_line_drops_when_queue_full(self):
+        client, _ = make_client()
+        # Fill the queue to capacity, then one more must NOT raise.
+        for _ in range(client._send_q.maxsize):
+            client._send_q.put_nowait(b"x\r\n")
+        client.send_line("PRIVMSG", ["#c", "overflow"])  # should warn + drop, not raise
+        assert client._send_q.full()
+
+    def test_strip_code_fence_multiline(self):
+        md = "before\n```python\ncode line 1\ncode line 2\n```\nafter"
+        out = ircx.strip_markdown(md)
+        assert "```" not in out
+        assert "code line 1" in out and "after" in out
+
+    def test_bold_does_not_swallow_newlines(self):
+        # An unterminated ** must not eat the next line (no DOTALL).
+        md = "**oops\nsecond line"
+        out = ircx.markdown_to_irc(md)
+        assert "second line" in out
+        assert "\n" in out  # newline preserved
+
+    def test_sasl_plain_rejects_overlong_field(self):
+        with pytest.raises(ircx.SASLError):
+            ircx.sasl_plain_payload("user", "p" * 300)
+
+    @pytest.mark.asyncio
+    async def test_part_purges_cooldown_and_buffer(self, monkeypatch):
+        adapter, client = await make_adapter(
+            monkeypatch, allow_agent_join=True,
+            channels=[ChannelSpec("#chan"), ChannelSpec("#gone")])
+        adapter._mark_connected()
+        # seed per-channel state
+        adapter._last_spontaneous["#gone"] = 123.0
+        adapter._buf("#gone")
+        assert client.casefold("#gone") in adapter._buffers
+        await adapter.runtime_part("#gone")
+        assert "#gone" not in adapter._last_spontaneous
+        assert client.casefold("#gone") not in adapter._buffers
+
+    @pytest.mark.asyncio
+    async def test_mid_session_433_does_not_mangle_nick(self):
+        client, _ = make_client()
+        # Simulate completed registration on our configured nick.
+        for raw in [":srv 001 hermesx :hi"]:
+            for line in client.server.recv((raw + "\r\n").encode()):
+                client.server.parse_tokens(line)
+                await client._handle_line(line)
+        client._registered_evt.set()
+        before = client._desired_nick
+        await client._handle_nick_in_use()  # mid-session 433
+        # Must NOT append a suffix mid-session.
+        assert client._desired_nick == before
+
+    @pytest.mark.asyncio
+    async def test_nick_regain_sends_nick(self):
+        client, _ = make_client(nickname="pascal")
+        # Pretend we're registered but stuck on a suffixed nick.
+        for raw in [":srv 001 pascal_ :hi"]:
+            for line in client.server.recv((raw + "\r\n").encode()):
+                client.server.parse_tokens(line)
+                await client._handle_line(line)
+        client._registered_evt.set()
+        client._maybe_regain_nick()
+        out = drain(client)
+        assert any(l == "NICK pascal" for l in out)
+
+    @pytest.mark.asyncio
+    async def test_log_write_offloaded_no_loop_block(self, monkeypatch, tmp_path):
+        # _record_line on the loop must schedule the write via executor and
+        # the file must eventually contain the line.
+        _clear_irc_env(monkeypatch)
+        from gateway.config import PlatformConfig
+        import asyncio as _a
+        a = IRCXAdapter(PlatformConfig(extra={"server": "s", "channels": ["#chan"]}))
+        a.cfg = IRCXConfig(server="irc.test", nickname="hermesx",
+                           channels=[ChannelSpec("#chan")], log_dir=str(tmp_path))
+        c, _ = make_client()
+        a._client = c
+        a._record_line("#chan", "bob", "hello disk")
+        # let the executor run
+        await _a.sleep(0.2)
+        logs = list(tmp_path.glob("*.log"))
+        assert logs and "hello disk" in logs[0].read_text(encoding="utf-8")
