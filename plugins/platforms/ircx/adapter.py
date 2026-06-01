@@ -452,9 +452,38 @@ def strip_irc_control_chars(text: str) -> str:
     return text.replace("\r", " ").replace("\n", " ").replace("\x00", "")
 
 
+def _write_log_line(path: str, line: str) -> None:
+    """Append a single line to *path*, swallowing I/O errors.
+
+    Module-level so it can run on an executor thread without holding a
+    reference to the adapter. Best-effort: logging must never take down the
+    connection, so any failure is dropped.
+    """
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove triple-backtick fence *markers* (with optional language tag),
+    keeping the code content. Handles fences anywhere on a line, including a
+    multi-line block's opening and closing fences. Inline (single-backtick)
+    handling is done separately, per line.
+
+    Note: we deliberately do NOT run the bold/italic substitutions with
+    ``re.DOTALL``. On IRC each rendered line stands alone, and a greedy
+    ``.+?`` across newlines would let an unterminated ``**`` swallow an entire
+    paragraph. Keeping ``.`` newline-bounded means a stray marker degrades to
+    a single literal char on one line — never a broken multi-line render.
+    """
+    return re.sub(r"```[\w+.\-/]*[ \t]*\n?", "", text)
+
+
 def strip_markdown(text: str) -> str:
     """Convert common markdown to plain text for IRC."""
-    text = re.sub(r"```[\w-]*\n?", "", text)          # code fences
+    text = _strip_code_fences(text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)        # **bold**
     text = re.sub(r"__(.+?)__", r"\1", text)            # __bold__
     text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)  # *italic*
@@ -467,7 +496,7 @@ def strip_markdown(text: str) -> str:
 
 def markdown_to_irc(text: str) -> str:
     """Convert a subset of markdown to mIRC formatting control codes."""
-    text = re.sub(r"```[\w-]*\n?", "", text)
+    text = _strip_code_fences(text)
     text = re.sub(r"\*\*(.+?)\*\*", _C_BOLD + r"\1" + _C_BOLD, text)
     text = re.sub(r"__(.+?)__", _C_BOLD + r"\1" + _C_BOLD, text)
     text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", _C_ITALIC + r"\1" + _C_ITALIC, text)
@@ -525,6 +554,12 @@ class SASLError(Exception):
 
 def sasl_plain_payload(authcid: str, password: str, authzid: str = "") -> str:
     raw = f"{authzid}\x00{authcid}\x00{password}".encode("utf-8")
+    # RFC 4616 SASL PLAIN: each field must be < 256 *bytes*. Some strict
+    # daemons reject the AUTHENTICATE pre-base64. Fail clearly here rather
+    # than have the server abort the handshake with an opaque error.
+    for name, field in (("authcid", authcid), ("password", password), ("authzid", authzid)):
+        if len(field.encode("utf-8")) > 255:
+            raise SASLError(f"SASL PLAIN {name} exceeds 255 bytes")
     return base64.b64encode(raw).decode("ascii")
 
 
@@ -650,7 +685,9 @@ class IRCClient:
         self._recv_task: Optional[asyncio.Task] = None
         self._send_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
-        self._send_q: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+        # Bounded so a flood (or a long rate-limit stall while inbound spikes)
+        # applies backpressure instead of growing the queue without limit.
+        self._send_q: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(maxsize=512)
 
         self._desired_nick = cfg.nickname + nick_suffix
         self._nick_attempt = 0
@@ -670,6 +707,9 @@ class IRCClient:
         self._closing = False
         self._last_rx = 0.0
         self._awaiting_pong = False
+        # Event loop this client runs on, captured at connect() so tool handlers
+        # in Hermes' ThreadPoolExecutor can schedule coroutines back onto it.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Batch refs that belong to a draft/chathistory replay (Feature C),
         # so replayed messages can be flagged is_history and not re-answered.
@@ -719,6 +759,7 @@ class IRCClient:
         gateway's reconnect watcher can re-invoke it.
         """
         self._reset_state()
+        self._loop = asyncio.get_running_loop()
         ssl_ctx = self._make_ssl_context()
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_connection(self.cfg.server, self.cfg.port, ssl=ssl_ctx),
@@ -780,8 +821,13 @@ class IRCClient:
             if task:
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                except asyncio.CancelledError:
+                    pass  # expected: we cancelled it just above
+                except Exception:
+                    # A real crash in a loop (e.g. a parser bug) must not be
+                    # silently masked during shutdown — log it so it's
+                    # diagnosable instead of vanishing.
+                    logger.exception("IRCX: task crashed during disconnect")
         if self._writer:
             try:
                 self._writer.close()
@@ -819,7 +865,14 @@ class IRCClient:
     def send_line(self, command: str, params: Optional[List[str]] = None, tags: Optional[Dict[str, str]] = None) -> None:
         """Queue an IRC line for sending (rate-limited by the send loop)."""
         line = irctokens.build(command, params or [], tags=tags)
-        self._send_q.put_nowait(line.format().encode("utf-8") + b"\r\n")
+        data = line.format().encode("utf-8") + b"\r\n"
+        try:
+            self._send_q.put_nowait(data)
+        except asyncio.QueueFull:
+            # Backpressure: outbound queue saturated (flood / long rate-limit
+            # stall). Dropping the newest line beats unbounded memory growth;
+            # PING/PONG keepalive still recovers a genuinely wedged link.
+            logger.warning("IRCX: outbound queue full, dropping %s", command)
 
     async def _send_loop(self) -> None:
         """Drain the outbound queue with token-bucket flood protection."""
@@ -878,6 +931,10 @@ class IRCClient:
             while True:
                 await asyncio.sleep(self.cfg.ping_interval)
                 loop = asyncio.get_running_loop()
+                # Opportunistically reclaim our configured nick if we drifted
+                # off it (mid-session 433 recovery, netsplit, forced change).
+                if self._registered_evt.is_set():
+                    self._maybe_regain_nick()
                 idle = loop.time() - self._last_rx
                 if idle < self.cfg.ping_interval:
                     continue
@@ -971,6 +1028,13 @@ class IRCClient:
             pass
 
     async def _handle_nick_in_use(self) -> None:
+        # Post-registration, a 433 means a *regain* attempt (in the keepalive
+        # loop) lost the race — someone still holds our configured nick. Don't
+        # mangle our current working nick; just let the next regain tick retry.
+        if self._registered_evt.is_set():
+            logger.debug("IRCX: nick regain failed (433); will retry later")
+            return
+        # During registration, try the next suffixed candidate.
         self._nick_attempt += 1
         base = self.cfg.nickname.rstrip("_0123456789")[:24] or "hermes-bot"
         if self._nick_attempt == 1:
@@ -979,6 +1043,20 @@ class IRCClient:
             candidate = f"{base}_{self._nick_attempt}"
         self._desired_nick = candidate[:30]
         self.send_line("NICK", [self._desired_nick])
+
+    def _maybe_regain_nick(self) -> None:
+        """Reclaim our configured nick if we drifted off it (netsplit, forced
+        change, collision-suffix during registration). Best-effort: we send a
+        NICK and let the server confirm; a 433 just means try again next tick.
+        """
+        try:
+            want = self.cfg.nickname
+            have = self.current_nick
+            if want and have and not self.casefold_equals(want, have):
+                logger.info("IRCX: attempting to regain nick %s (currently %s)", want, have)
+                self.send_line("NICK", [want])
+        except Exception:
+            pass
 
     # ---- CAP / SASL -------------------------------------------------------
 
@@ -1322,7 +1400,21 @@ class IRCXAdapter(BasePlatformAdapter):
 
     def _record_line(self, chat_id: str, sender: str, text: str) -> None:
         self._buf(chat_id).append(f"{sender}: {text}")
-        self._append_log(chat_id, sender, text)
+        # Disk append is offloaded so it never blocks the asyncio event loop
+        # (this runs in the recv path on every message). Fire-and-forget on
+        # the loop's default executor; failures are swallowed inside the job.
+        path = self._log_path(chat_id)
+        if not path:
+            return
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        line = f"{ts}\t{sender}\t{text}\n"
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, _write_log_line, path, line)
+        except RuntimeError:
+            # No running loop (e.g. unit tests calling _record_line directly):
+            # fall back to a direct write — there's no loop to block.
+            _write_log_line(path, line)
 
     def _format_context(self, chat_id: str) -> Optional[str]:
         buf = self._buffers.get(self._client.casefold(chat_id) if self._client else chat_id.lower())
@@ -1346,15 +1438,17 @@ class IRCXAdapter(BasePlatformAdapter):
         return _os.path.join(d, safe + ".log")
 
     def _append_log(self, chat_id: str, sender: str, text: str) -> None:
+        """Synchronous append (used by tests / non-loop callers).
+
+        The hot path in ``_record_line`` offloads writes to an executor so the
+        event loop never blocks on disk; this direct version is retained for
+        callers that aren't on the loop.
+        """
         path = self._log_path(chat_id)
         if not path:
             return
-        try:
-            ts = datetime.datetime.now().isoformat(timespec="seconds")
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(f"{ts}\t{sender}\t{text}\n")
-        except Exception:
-            pass
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        _write_log_line(path, f"{ts}\t{sender}\t{text}\n")
 
     def _seed_buffer_from_log(self, chat_id: str, buf) -> None:
         """Replay the tail of the on-disk log so context survives restarts."""
@@ -1728,6 +1822,13 @@ class IRCXAdapter(BasePlatformAdapter):
             return {"error": "agent JOIN/PART is disabled (set IRCX_ALLOW_AGENT_JOIN=true)"}
         self.cfg.channels = [c for c in self.cfg.channels
                              if self._client.casefold(c.name) != self._client.casefold(channel)]
+        # Drop per-channel state so leaving many channels over a long uptime
+        # doesn't accumulate stale entries (spontaneous cooldown + context buf).
+        self._last_spontaneous.pop(channel.lower(), None)
+        try:
+            self._buffers.pop(self._client.casefold(channel), None)
+        except Exception:
+            pass
         self._client.part(channel, reason)
         return {"success": True, "parted": channel}
 
@@ -1798,7 +1899,7 @@ def _ircx_join_tool(args: dict, **kwargs) -> str:
         return json.dumps({"error": "IRC not connected in this process"})
     channel = str(args.get("channel", "")).strip()
     key = args.get("key") or None
-    res = _run_coro(adapter.runtime_join(channel, key))
+    res = _run_adapter_coro(adapter, adapter.runtime_join(channel, key))
     return json.dumps(res)
 
 
@@ -1807,7 +1908,7 @@ def _ircx_part_tool(args: dict, **kwargs) -> str:
     adapter = _live_ircx_adapter()
     if adapter is None:
         return json.dumps({"error": "IRC not connected in this process"})
-    res = _run_coro(adapter.runtime_part(str(args.get("channel", "")).strip(), args.get("reason")))
+    res = _run_adapter_coro(adapter, adapter.runtime_part(str(args.get("channel", "")).strip(), args.get("reason")))
     return json.dumps(res)
 
 
@@ -1816,7 +1917,7 @@ def _ircx_say_tool(args: dict, **kwargs) -> str:
     adapter = _live_ircx_adapter()
     if adapter is None:
         return json.dumps({"error": "IRC not connected in this process"})
-    res = _run_coro(adapter.runtime_say(str(args.get("target", "")).strip(), str(args.get("text", ""))))
+    res = _run_adapter_coro(adapter, adapter.runtime_say(str(args.get("target", "")).strip(), str(args.get("text", ""))))
     return json.dumps(res)
 
 
@@ -1833,7 +1934,7 @@ def _ircx_channel_info_tool(args: dict, **kwargs) -> str:
     adapter = _live_ircx_adapter()
     if adapter is None:
         return json.dumps({"error": "IRC not connected in this process"})
-    res = _run_coro(adapter.runtime_channel_info(str(args.get("channel", "")).strip()))
+    res = _run_adapter_coro(adapter, adapter.runtime_channel_info(str(args.get("channel", "")).strip()))
     return json.dumps(res)
 
 
@@ -1842,22 +1943,43 @@ def _ircx_whois_tool(args: dict, **kwargs) -> str:
     adapter = _live_ircx_adapter()
     if adapter is None:
         return json.dumps({"error": "IRC not connected in this process"})
-    res = _run_coro(adapter.runtime_whois(str(args.get("nick", "")).strip()))
+    res = _run_adapter_coro(adapter, adapter.runtime_whois(str(args.get("nick", "")).strip()))
     return json.dumps(res)
 
 
-def _run_coro(coro):
-    """Run *coro* to completion from a (possibly sync) tool handler."""
-    import asyncio as _asyncio
+def _run_adapter_coro(adapter, coro, timeout: float = 30.0):
+    """Run an adapter coroutine from a tool handler, on the *gateway* loop.
+
+    Hermes dispatches tools inside a ThreadPoolExecutor worker thread (see
+    agent/tool_executor.py), so there is normally no running loop in this
+    thread. The coroutine touches the client's send queue and StreamWriter,
+    which are bound to the gateway's event loop — running it on any *other*
+    loop (e.g. a throwaway ``asyncio.run`` loop) is cross-loop-unsafe. So we
+    schedule it onto the loop the client captured at connect() time and block
+    this worker thread for the result.
+
+    This cannot deadlock: we run on a worker thread, never the loop thread,
+    so blocking here does not stop the loop from ticking. If, unexpectedly,
+    we ARE on the gateway loop thread, ``run_coroutine_threadsafe`` would
+    deadlock — so we detect that and fall back to a fresh loop instead.
+    """
+    client = getattr(adapter, "_client", None)
+    loop = getattr(client, "_loop", None) if client is not None else None
+
     try:
-        loop = _asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        # Called from within the event loop (is_async path) — schedule and wait.
-        fut = _asyncio.run_coroutine_threadsafe(coro, loop)
-        return fut.result(timeout=30)
-    return _asyncio.run(coro)
+        running = None
+
+    if loop is not None and loop.is_running() and running is not loop:
+        # Normal path: worker thread → schedule onto the gateway loop.
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=timeout)
+
+    # No live gateway loop (e.g. tests), or we're somehow on the loop thread:
+    # run on a private loop. Safe because nothing here shares loop-bound state
+    # in that scenario.
+    return asyncio.run(coro)
 
 
 _IRCX_TOOL_SCHEMAS = {
