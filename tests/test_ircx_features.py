@@ -469,3 +469,154 @@ class TestAuditFixes:
         await _a.sleep(0.2)
         logs = list(tmp_path.glob("*.log"))
         assert logs and "hello disk" in logs[0].read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Wishlist tools: topic / notice / nick / mode / kick / accounts / search
+# ---------------------------------------------------------------------------
+
+def _seed_op_roster(client, me_op=True):
+    me = "@pascal" if me_op else "pascal"
+    for raw in [
+        ":srv 001 pascal :hi",
+        ":pascal!u@h JOIN #ops",
+        f":srv 353 pascal = #ops :{me} @alice bob",
+        ":srv 366 pascal #ops :end",
+        ":srv 324 pascal #ops +nt",
+        ":srv 332 pascal #ops :the topic",
+        ":bob!b@h JOIN #ops bobacct :Bob Real",  # extended-join: account in 3rd param
+    ]:
+        for line in client.server.recv((raw + "\r\n").encode()):
+            client.server.parse_tokens(line)
+
+
+class TestWishlistTools:
+    @pytest.mark.asyncio
+    async def test_topic_read_and_set(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client)
+        adapter._mark_connected()
+        read = await adapter.runtime_topic("#ops")
+        assert read["topic"] == "the topic"
+        setres = await adapter.runtime_topic("#ops", "new topic")
+        assert setres.get("topic_set") == "new topic"
+        assert any(l.startswith("TOPIC #ops :new topic") for l in drain(client))
+
+    @pytest.mark.asyncio
+    async def test_notice_sends_notice(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client)
+        adapter._mark_connected()
+        res = await adapter.runtime_notice("#ops", "automated ping")
+        assert res.get("success")
+        assert any(l.startswith("NOTICE #ops :automated ping") for l in drain(client))
+
+    @pytest.mark.asyncio
+    async def test_nick_change(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch)
+        adapter._mark_connected()
+        assert "error" in await adapter.runtime_nick("bad nick")  # space invalid
+        res = await adapter.runtime_nick("pascal2")
+        assert res.get("requested_nick") == "pascal2"
+        assert "NICK pascal2" in drain(client)
+
+    @pytest.mark.asyncio
+    async def test_mode_read(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client)
+        adapter._mark_connected()
+        res = await adapter.runtime_mode("#ops")
+        assert res.get("success") and set(res["modes"]) == {"n", "t"}
+
+    @pytest.mark.asyncio
+    async def test_mode_set_requires_op(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client, me_op=False)  # not an op
+        adapter._mark_connected()
+        res = await adapter.runtime_mode("#ops", "+m")
+        assert "error" in res and "operator" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_mode_set_as_op(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client, me_op=True)
+        adapter._mark_connected()
+        res = await adapter.runtime_mode("#ops", "+m")
+        assert res.get("success")
+        assert any(l.startswith("MODE #ops +m") for l in drain(client))
+
+    @pytest.mark.asyncio
+    async def test_kick_disabled_by_default(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client, me_op=True)
+        adapter._mark_connected()
+        res = await adapter.runtime_kick("#ops", "bob")
+        assert "error" in res and "disabled" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_kick_needs_op_even_when_allowed(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, allow_agent_kick=True,
+                                             channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client, me_op=False)
+        adapter._mark_connected()
+        res = await adapter.runtime_kick("#ops", "bob")
+        assert "error" in res and "operator" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_kick_works_when_allowed_and_op(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, allow_agent_kick=True,
+                                             channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client, me_op=True)
+        adapter._mark_connected()
+        assert "error" in await adapter.runtime_kick("#ops", "pascal")  # refuse self
+        res = await adapter.runtime_kick("#ops", "bob", "spam")
+        assert res.get("kicked") == "bob"
+        assert any(l.startswith("KICK #ops bob") for l in drain(client))
+
+    @pytest.mark.asyncio
+    async def test_accounts_online(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")],
+                                             allow_from=["bobacct"])
+        _seed_op_roster(client)
+        adapter._mark_connected()
+        res = await adapter.runtime_accounts_online()
+        assert res.get("success")
+        assert any(u["account"] == "bobacct" for u in res["online"])
+
+    @pytest.mark.asyncio
+    async def test_search_history_needs_logging(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        adapter._mark_connected()
+        res = await adapter.runtime_search_history("hello")
+        assert "error" in res and "IRCX_LOG_DIR" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_search_history_matches(self, monkeypatch, tmp_path):
+        adapter, client = await make_adapter(
+            monkeypatch, channels=[ChannelSpec("#ops")], log_dir=str(tmp_path))
+        adapter._mark_connected()
+        adapter._append_log("#ops", "alice", "the answer is 42")
+        adapter._append_log("#ops", "bob", "unrelated noise")
+        adapter._append_log("#ops", "alice", "more about 42 here")
+        res = await adapter.runtime_search_history("42", "#ops", sender="alice")
+        assert res.get("success") and res["match_count"] == 2
+        assert all(h["sender"] == "alice" for h in res["matches"])
+
+    def test_new_tools_registered(self):
+        captured = []
+        class Ctx:
+            def register_platform(self, **kw): pass
+            def register_tool(self, **kw): captured.append(kw["name"])
+        ircx.register(Ctx())
+        for t in ("irc_topic", "irc_notice", "irc_nick", "irc_mode",
+                  "irc_kick", "irc_accounts_online", "irc_search_history"):
+            assert t in captured
+
+    def test_kick_config_flag(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_SERVER", "s")
+        monkeypatch.setenv("IRCX_CHANNEL", "#c")
+        monkeypatch.setenv("IRCX_ALLOW_AGENT_KICK", "true")
+        from gateway.config import PlatformConfig
+        cfg = ircx.load_config(PlatformConfig())
+        assert cfg.allow_agent_kick is True

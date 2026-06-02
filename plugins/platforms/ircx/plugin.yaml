@@ -1,7 +1,7 @@
 name: ircx-platform
 label: IRC
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
   Full-featured IRCv3 gateway adapter for Hermes Agent.  Connects to one or
   more IRC channels (and DMs) and relays messages to/from the Hermes agent.
@@ -148,4 +148,8 @@ optional_env:
   - name: IRCX_CHATHISTORY_LIMIT
     description: "How many backlog messages to fetch via IRCv3 draft/chathistory on (re)join, where supported (default: 50)."
     prompt: "Chathistory fetch size"
+    password: false
+  - name: IRCX_ALLOW_AGENT_KICK
+    description: "Allow the agent to KICK users via the irc_kick tool (still requires the bot to be a channel operator). Default: false."
+    prompt: "Allow agent to kick? (true/false)"
     password: false

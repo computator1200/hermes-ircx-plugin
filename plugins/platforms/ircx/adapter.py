@@ -219,6 +219,7 @@ class IRCXConfig:
     # --- Runtime agency tools (Feature B) ---
     allow_agent_join: bool = False        # let the agent JOIN/PART at runtime
     joinable_channels: List[str] = field(default_factory=list)  # empty = any
+    allow_agent_kick: bool = False        # let the agent KICK (still needs to be a channel op)
 
     # --- Context persistence across disconnects (Feature C) ---
     log_dir: Optional[str] = None         # if set, log channel lines + replay tail
@@ -425,6 +426,8 @@ def load_config(platform_config: Any) -> IRCXConfig:
     aj_env = _env("IRCX_ALLOW_AGENT_JOIN")
     cfg.allow_agent_join = _truthy(aj_env) if aj_env is not None else bool(extra.get("allow_agent_join", False))
     cfg.joinable_channels = _coerce_str_list(_env("IRCX_JOINABLE_CHANNELS") or extra.get("joinable_channels"))
+    ak_env = _env("IRCX_ALLOW_AGENT_KICK")
+    cfg.allow_agent_kick = _truthy(ak_env) if ak_env is not None else bool(extra.get("allow_agent_kick", False))
 
     # --- Feature C: persistence ---
     cfg.log_dir = _env("IRCX_LOG_DIR") or extra.get("log_dir")
@@ -1270,6 +1273,47 @@ class IRCClient:
     def part(self, channel: str, reason: Optional[str] = None) -> None:
         self.send_line("PART", [channel, reason] if reason else [channel])
 
+    def notice(self, target: str, text: str) -> None:
+        self.send_line("NOTICE", [target, strip_irc_control_chars(text)])
+
+    def set_topic(self, channel: str, topic: str) -> None:
+        self.send_line("TOPIC", [channel, strip_irc_control_chars(topic)])
+
+    def request_topic(self, channel: str) -> None:
+        self.send_line("TOPIC", [channel])
+
+    def set_nick(self, nick: str) -> None:
+        self.send_line("NICK", [nick])
+
+    def request_modes(self, channel: str) -> None:
+        self.send_line("MODE", [channel])
+
+    def set_modes(self, channel: str, modestring: str, args: Optional[List[str]] = None) -> None:
+        self.send_line("MODE", [channel, modestring] + (args or []))
+
+    def kick(self, channel: str, nick: str, reason: Optional[str] = None) -> None:
+        self.send_line("KICK", [channel, nick, reason] if reason else [channel, nick])
+
+    def channel_modes(self, channel: str) -> Optional[List[str]]:
+        try:
+            ch = self.server.channels.get(self.casefold(channel))
+            if ch is None:
+                return None
+            return sorted(getattr(ch, "modes", {}) or {})
+        except Exception:
+            return None
+
+    def am_i_op(self, channel: str) -> bool:
+        """True if the bot currently holds op (+o) in *channel*."""
+        try:
+            ch = self.server.channels.get(self.casefold(channel))
+            if ch is None:
+                return False
+            me = ch.users.get(self.casefold(self.current_nick))
+            return bool(me and "o" in (getattr(me, "modes", set()) or set()))
+        except Exception:
+            return False
+
     def joined_channels(self) -> List[str]:
         try:
             return [getattr(c, "name", k) for k, c in self.server.channels.items()]
@@ -1875,6 +1919,147 @@ class IRCXAdapter(BasePlatformAdapter):
             return {"error": f"{nick} is not visible in any channel the bot shares"}
         return {"success": True, **info}
 
+    async def runtime_topic(self, channel: str, topic: Optional[str] = None) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not channel and self.cfg.channels:
+            channel = self.cfg.channels[0].name
+        if not self._client.is_channel(channel):
+            return {"error": f"{channel} is not a channel"}
+        if not self._client.in_channel(channel):
+            return {"error": f"not in channel {channel}"}
+        if topic is None:
+            info = self._client.channel_info(channel)
+            return {"success": True, "channel": channel, "topic": (info or {}).get("topic")}
+        # Setting a topic may require +t op rights; the server will reject if so.
+        self._client.set_topic(channel, topic)
+        return {"success": True, "channel": channel, "topic_set": topic}
+
+    async def runtime_notice(self, target: str, text: str) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not target or any(c in target for c in ("\r", "\n", "\x00", " ")):
+            return {"error": "invalid target"}
+        if target[0] in "#&+!" and not self._client.in_channel(target):
+            return {"error": f"not in channel {target}"}
+        for line in split_message(text, target, self.cfg.max_message_length,
+                                  convert_formatting=self.cfg.convert_formatting):
+            self._client.notice(target, line)
+        return {"success": True, "target": target}
+
+    async def runtime_nick(self, nick: str) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        nick = (nick or "").strip()
+        if not nick or any(c in nick for c in ("\r", "\n", "\x00", " ", ",")) or nick[0] in "#&+!:":
+            return {"error": "invalid nickname"}
+        self._client.set_nick(nick)
+        return {"success": True, "requested_nick": nick,
+                "note": "the server confirms NICK changes asynchronously"}
+
+    async def runtime_mode(self, channel: str, modestring: Optional[str] = None,
+                           args: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not channel and self.cfg.channels:
+            channel = self.cfg.channels[0].name
+        if not self._client.is_channel(channel):
+            return {"error": f"{channel} is not a channel"}
+        if not self._client.in_channel(channel):
+            return {"error": f"not in channel {channel}"}
+        if modestring is None:
+            return {"success": True, "channel": channel,
+                    "modes": self._client.channel_modes(channel)}
+        # Changing modes requires the bot to be a channel op.
+        if not self._client.am_i_op(channel):
+            return {"error": f"cannot change modes: the bot is not an operator in {channel}"}
+        clean = modestring.strip()
+        if not clean or any(c in clean for c in ("\r", "\n", "\x00", " ")):
+            return {"error": "invalid mode string"}
+        safe_args = [a for a in (args or []) if not any(c in a for c in ("\r", "\n", "\x00", " "))]
+        self._client.set_modes(channel, clean, safe_args)
+        return {"success": True, "channel": channel, "mode_change": clean, "args": safe_args}
+
+    async def runtime_kick(self, channel: str, nick: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not self.cfg.allow_agent_kick:
+            return {"error": "agent KICK is disabled (set IRCX_ALLOW_AGENT_KICK=true to enable)"}
+        if not self._client.is_channel(channel) or not self._client.in_channel(channel):
+            return {"error": f"not in channel {channel}"}
+        if not nick or any(c in nick for c in ("\r", "\n", "\x00", " ")):
+            return {"error": "invalid nick"}
+        if self._client.casefold_equals(nick, self._client.current_nick):
+            return {"error": "refusing to kick myself"}
+        if not self._client.am_i_op(channel):
+            return {"error": f"cannot kick: the bot is not an operator in {channel}"}
+        self._client.kick(channel, nick, reason)
+        return {"success": True, "channel": channel, "kicked": nick}
+
+    async def runtime_accounts_online(self) -> Dict[str, Any]:
+        """Which allowed users (by verified account or nick) are visible right now."""
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        allowed = _coerce_str_list(_env("IRCX_ALLOWED_USERS", "IRC_ALLOWED_USERS")) or list(self.cfg.allow_from)
+        if not allowed:
+            return {"success": True, "online": [], "note": "no allowed_users configured"}
+        allowed_l = {a.lower() for a in allowed}
+        online = []
+        try:
+            for nick_cf, user in self._client.server.users.items():
+                acct = (getattr(user, "account", None) or "")
+                nick = user.nickname
+                if acct.lower() in allowed_l or nick.lower() in allowed_l:
+                    online.append({"nick": nick, "account": acct or None,
+                                   "away": getattr(user, "away", None)})
+        except Exception:
+            pass
+        return {"success": True, "online": online, "count": len(online)}
+
+    async def runtime_search_history(self, query: str, channel: str = "",
+                                     sender: str = "", limit: int = 20) -> Dict[str, Any]:
+        """Search the on-disk channel logs (requires IRCX_LOG_DIR)."""
+        if not self.cfg.log_dir:
+            return {"error": "history search needs logging enabled (set IRCX_LOG_DIR)"}
+        target = channel or (self.cfg.channels[0].name if self.cfg.channels else "")
+        if not target:
+            return {"error": "no channel specified"}
+        path = self._log_path(target)
+        if not path:
+            return {"error": "could not resolve log path"}
+        q = (query or "").lower()
+        snd = (sender or "").lower()
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit = 20
+
+        def _search() -> List[Dict[str, str]]:
+            import os as _os
+            if not _os.path.exists(path):
+                return []
+            hits: List[Dict[str, str]] = []
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for row in fh:
+                    parts = row.rstrip("\n").split("\t", 2)
+                    if len(parts) != 3:
+                        continue
+                    ts, who, text = parts
+                    if snd and who.lower() != snd:
+                        continue
+                    if q and q not in text.lower():
+                        continue
+                    hits.append({"time": ts, "sender": who, "text": text})
+            return hits[-limit:]
+
+        try:
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(None, _search)
+        except RuntimeError:
+            results = _search()
+        return {"success": True, "channel": target, "query": query,
+                "match_count": len(results), "matches": results}
+
 
 # ===========================================================================
 # Plugin module-level hooks
@@ -1944,6 +2129,87 @@ def _ircx_whois_tool(args: dict, **kwargs) -> str:
     if adapter is None:
         return json.dumps({"error": "IRC not connected in this process"})
     res = _run_adapter_coro(adapter, adapter.runtime_whois(str(args.get("nick", "")).strip()))
+    return json.dumps(res)
+
+
+def _ircx_topic_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    topic = args.get("topic")
+    res = _run_adapter_coro(adapter, adapter.runtime_topic(
+        str(args.get("channel", "")).strip(),
+        None if topic is None else str(topic)))
+    return json.dumps(res)
+
+
+def _ircx_notice_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_notice(
+        str(args.get("target", "")).strip(), str(args.get("text", ""))))
+    return json.dumps(res)
+
+
+def _ircx_nick_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_nick(str(args.get("nick", "")).strip()))
+    return json.dumps(res)
+
+
+def _ircx_mode_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    mode = args.get("mode")
+    margs = args.get("args") or []
+    if isinstance(margs, str):
+        margs = margs.split()
+    res = _run_adapter_coro(adapter, adapter.runtime_mode(
+        str(args.get("channel", "")).strip(),
+        None if mode is None else str(mode),
+        [str(a) for a in margs]))
+    return json.dumps(res)
+
+
+def _ircx_kick_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_kick(
+        str(args.get("channel", "")).strip(),
+        str(args.get("nick", "")).strip(),
+        args.get("reason")))
+    return json.dumps(res)
+
+
+def _ircx_accounts_online_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_accounts_online())
+    return json.dumps(res)
+
+
+def _ircx_search_history_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_search_history(
+        str(args.get("query", "")),
+        str(args.get("channel", "")).strip(),
+        str(args.get("sender", "")).strip(),
+        args.get("limit", 20)))
     return json.dumps(res)
 
 
@@ -2059,6 +2325,110 @@ _IRCX_TOOL_SCHEMAS = {
                 "nick": {"type": "string", "description": "The nickname to look up."},
             },
             "required": ["nick"],
+        },
+    },
+    "irc_topic": {
+        "name": "irc_topic",
+        "description": (
+            "Read or set a channel's topic. Omit 'topic' to read the current "
+            "topic; provide it to change the topic (the server may require the "
+            "bot to be a channel operator)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel; defaults to the primary channel."},
+                "topic": {"type": "string", "description": "New topic. Omit to just read."},
+            },
+        },
+    },
+    "irc_notice": {
+        "name": "irc_notice",
+        "description": (
+            "Send an IRC NOTICE (instead of a normal message) to a channel the "
+            "bot is in, or to a nick. NOTICEs are the convention for automated "
+            "/ non-conversational bot output and suppress client auto-replies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Channel (#x) or nick."},
+                "text": {"type": "string"},
+            },
+            "required": ["target", "text"],
+        },
+    },
+    "irc_nick": {
+        "name": "irc_nick",
+        "description": (
+            "Change the bot's own nickname at runtime. The server confirms the "
+            "change asynchronously; note the bot's keepalive will try to reclaim "
+            "its configured nick over time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"nick": {"type": "string"}},
+            "required": ["nick"],
+        },
+    },
+    "irc_mode": {
+        "name": "irc_mode",
+        "description": (
+            "Read or change channel modes. Omit 'mode' to read current modes "
+            "(answers 'what's the mode on #channel?'); provide e.g. '+m' or "
+            "'-t' to change them (requires the bot to be a channel operator)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel; defaults to the primary channel."},
+                "mode": {"type": "string", "description": "Mode change like '+m', '-t', '+o nick'. Omit to read."},
+                "args": {"type": "string", "description": "Optional space-separated mode arguments."},
+            },
+        },
+    },
+    "irc_kick": {
+        "name": "irc_kick",
+        "description": (
+            "Remove a user from a channel. Disabled unless the operator sets "
+            "IRCX_ALLOW_AGENT_KICK=true, and only works when the bot itself "
+            "holds operator status. Use sparingly and only when an op asks."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string"},
+                "nick": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["channel", "nick"],
+        },
+    },
+    "irc_accounts_online": {
+        "name": "irc_accounts_online",
+        "description": (
+            "List which of the bot's allowed users (by verified account or "
+            "nick) are currently visible/connected in shared channels. Answers "
+            "'who from my people is around right now?'."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    "irc_search_history": {
+        "name": "irc_search_history",
+        "description": (
+            "Search the bot's logged channel history by keyword, sender, and "
+            "channel (requires IRCX_LOG_DIR logging). Answers 'what did X say "
+            "about Y earlier?'. Returns matching lines with timestamps."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keyword/substring to match (case-insensitive)."},
+                "channel": {"type": "string", "description": "Channel to search; defaults to the primary channel."},
+                "sender": {"type": "string", "description": "Restrict to a specific sender nick."},
+                "limit": {"type": "integer", "description": "Max results (default 20, cap 100)."},
+            },
+            "required": ["query"],
         },
     },
 }
@@ -2294,6 +2664,13 @@ def register(ctx: Any) -> None:
             ("irc_list_channels", _ircx_list_tool),
             ("irc_channel_info", _ircx_channel_info_tool),
             ("irc_whois", _ircx_whois_tool),
+            ("irc_topic", _ircx_topic_tool),
+            ("irc_notice", _ircx_notice_tool),
+            ("irc_nick", _ircx_nick_tool),
+            ("irc_mode", _ircx_mode_tool),
+            ("irc_kick", _ircx_kick_tool),
+            ("irc_accounts_online", _ircx_accounts_online_tool),
+            ("irc_search_history", _ircx_search_history_tool),
         ):
             try:
                 _register(
