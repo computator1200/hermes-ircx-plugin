@@ -620,3 +620,153 @@ class TestWishlistTools:
         from gateway.config import PlatformConfig
         cfg = ircx.load_config(PlatformConfig())
         assert cfg.allow_agent_kick is True
+
+
+# ---------------------------------------------------------------------------
+# Agency wishlist 2: away / cycle / set_key / whois_server / ignore
+# ---------------------------------------------------------------------------
+
+class TestAgencyWishlist2:
+    @pytest.mark.asyncio
+    async def test_away_set_and_clear(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch)
+        adapter._mark_connected()
+        res = await adapter.runtime_away("stepping back")
+        assert res.get("away") is True and res["message"] == "stepping back"
+        assert client.away_message == "stepping back"
+        assert any(l.startswith("AWAY") and "stepping back" in l for l in drain(client))
+        cleared = await adapter.runtime_away()
+        assert cleared.get("away") is False
+        assert client.away_message is None
+        assert "AWAY" in drain(client)  # bare AWAY clears
+
+    @pytest.mark.asyncio
+    async def test_cycle_parts_then_rejoins(self, monkeypatch):
+        # speed up the part/join gap
+        async def _fast_sleep(*a, **k):
+            return None
+        monkeypatch.setattr(ircx.asyncio, "sleep", _fast_sleep)
+        adapter, client = await make_adapter(
+            monkeypatch, channels=[ChannelSpec("#ops", key="sekret")])
+        _seed_op_roster(client)
+        adapter._mark_connected()
+        res = await adapter.runtime_cycle("#ops")
+        assert res.get("cycled") == "#ops"
+        out = drain(client)
+        assert any(l.startswith("PART #ops") for l in out)
+        # rejoin must carry the preserved key
+        assert any(l.startswith("JOIN #ops sekret") for l in out)
+
+    @pytest.mark.asyncio
+    async def test_cycle_requires_membership(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch)
+        adapter._mark_connected()
+        res = await adapter.runtime_cycle("#notin")
+        assert "error" in res and "not in channel" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_set_key_requires_op(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client, me_op=False)
+        adapter._mark_connected()
+        res = await adapter.runtime_set_key("#ops", "hunter2")
+        assert "error" in res and "operator" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_set_key_sets_clears_and_persists(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, channels=[ChannelSpec("#ops")])
+        _seed_op_roster(client, me_op=True)
+        adapter._mark_connected()
+        # reject a key with whitespace
+        assert "error" in await adapter.runtime_set_key("#ops", "bad key")
+        res = await adapter.runtime_set_key("#ops", "hunter2")
+        assert res.get("key_set") is True
+        assert any(l.startswith("MODE #ops +k hunter2") for l in drain(client))
+        # persisted onto the channel spec for reconnect rejoin
+        assert adapter._channel_spec("#ops").key == "hunter2"
+        cleared = await adapter.runtime_set_key("#ops")
+        assert cleared.get("key_cleared") is True
+        assert any(l.startswith("MODE #ops -k hunter2") for l in drain(client))
+        assert adapter._channel_spec("#ops").key is None
+
+    @pytest.mark.asyncio
+    async def test_whois_server_online(self, monkeypatch):
+        import asyncio
+        adapter, client = await make_adapter(monkeypatch)
+        adapter._mark_connected()
+        task = asyncio.create_task(adapter.runtime_whois_server("stranger"))
+        await asyncio.sleep(0)  # let the WHOIS get sent + slot registered
+        assert any(l.startswith("WHOIS stranger") for l in drain(client))
+        await feed(
+            client,
+            ":srv 311 pascal stranger user host * :Real Name",
+            ":srv 312 pascal stranger irc.srv :A Server",
+            ":srv 330 pascal stranger strangeracct :is logged in as",
+            ":srv 319 pascal stranger :#a #b",
+            ":srv 318 pascal stranger :End of WHOIS",
+        )
+        res = await task
+        assert res.get("success")
+        assert res["nick"] == "stranger" and res["account"] == "strangeracct"
+        assert res["realname"] == "Real Name" and "#a" in res["channels"]
+
+    @pytest.mark.asyncio
+    async def test_whois_server_offline(self, monkeypatch):
+        import asyncio
+        adapter, client = await make_adapter(monkeypatch)
+        adapter._mark_connected()
+        task = asyncio.create_task(adapter.runtime_whois_server("ghost"))
+        await asyncio.sleep(0)
+        await feed(client, ":srv 401 pascal ghost :No such nick/channel")
+        res = await task
+        assert "error" in res and "not online" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_whois_server_rejects_bad_nick(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch)
+        adapter._mark_connected()
+        assert "error" in await adapter.runtime_whois_server("bad nick")
+
+    @pytest.mark.asyncio
+    async def test_ignore_drops_messages(self, monkeypatch):
+        adapter, _ = await make_adapter(monkeypatch, require_mention=False)
+        adapter._mark_connected()
+        res = await adapter.runtime_ignore("troll", 120)
+        assert res.get("ignored") == "troll" and res["seconds"] == 120
+        await adapter._on_irc_message(cmsg(sender_nick="troll", text="noise"))
+        adapter.handle_message.assert_not_called()
+        # not even recorded for context
+        assert not any("noise" in l for l in adapter._buf("#chan"))
+        # a different sender is unaffected
+        await adapter._on_irc_message(cmsg(sender_nick="alice", text="hello"))
+        adapter.handle_message.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_unignore_restores(self, monkeypatch):
+        adapter, _ = await make_adapter(monkeypatch, require_mention=False)
+        adapter._mark_connected()
+        await adapter.runtime_ignore("troll", 120)
+        un = await adapter.runtime_unignore("troll")
+        assert un.get("was_ignored") is True
+        await adapter._on_irc_message(cmsg(sender_nick="troll", text="back now"))
+        adapter.handle_message.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_ignore_expires(self, monkeypatch):
+        import time
+        adapter, _ = await make_adapter(monkeypatch, require_mention=False)
+        adapter._mark_connected()
+        # expiry already in the past
+        adapter._ignored["troll"] = time.monotonic() - 1
+        assert adapter._is_ignored("troll") is False
+        assert "troll" not in adapter._ignored  # lazily purged
+
+    def test_wishlist2_tools_registered(self):
+        captured = []
+        class Ctx:
+            def register_platform(self, **kw): pass
+            def register_tool(self, **kw): captured.append(kw["name"])
+        ircx.register(Ctx())
+        for t in ("irc_away", "irc_cycle", "irc_set_key", "irc_whois_server",
+                  "irc_ignore", "irc_unignore"):
+            assert t in captured

@@ -717,6 +717,8 @@ class IRCClient:
         # Batch refs that belong to a draft/chathistory replay (Feature C),
         # so replayed messages can be flagged is_history and not re-answered.
         self._chathistory_batches: set = set()
+        self._away_message = None
+        self._whois_pending = {}
 
     # ---- public properties ----------------------------------------------
 
@@ -1005,6 +1007,11 @@ class IRCClient:
             await self._handle_privmsg(line, is_notice=(command == "NOTICE"))
             return
 
+        # WHOIS reply numerics -> fulfil a pending whois() future.
+        if command in ("311","312","313","317","319","330","671","318","401","402","406") and len(line.params) >= 2:
+            self._collect_whois(command, line.params)
+            return
+
         # BATCH open/close — track draft/chathistory batches (Feature C).
         if command == "BATCH" and line.params:
             ref = line.params[0]
@@ -1020,6 +1027,38 @@ class IRCClient:
         if command == "366" and len(line.params) >= 2:
             await self._request_chathistory(line.params[1])
             return
+
+    def _collect_whois(self, command, params):
+        nick = params[1]
+        slot = self._whois_pending.get(self.casefold(nick))
+        if slot is None:
+            return
+        d = slot["data"]
+        if command == "311" and len(params) >= 6:
+            slot["found"] = True
+            d["nick"] = params[1]; d["username"] = params[2]
+            d["host"] = params[3]; d["realname"] = params[5]
+        elif command == "312" and len(params) >= 4:
+            d["server"] = params[2]; d["server_info"] = params[3]
+        elif command == "313":
+            d["operator"] = True
+        elif command == "317" and len(params) >= 3:
+            try: d["idle_seconds"] = int(params[2])
+            except (TypeError, ValueError): pass
+            if len(params) >= 4:
+                try: d["signon_time"] = int(params[3])
+                except (TypeError, ValueError): pass
+        elif command == "319":
+            d["channels"] = params[-1].split()
+        elif command == "330" and len(params) >= 3:
+            d["account"] = params[2]
+        elif command == "671":
+            d["secure"] = True
+        elif command in ("401","402","406"):
+            slot["found"] = False
+            slot["event"].set()
+        elif command == "318":
+            slot["event"].set()
 
     async def _request_chathistory(self, channel: str) -> None:
         """Fetch recent backlog on (re)join where the server supports it."""
@@ -1314,6 +1353,34 @@ class IRCClient:
         except Exception:
             return False
 
+    def set_away(self, message):
+        if message:
+            self._away_message = message
+            self.send_line("AWAY", [strip_irc_control_chars(message)])
+        else:
+            self._away_message = None
+            self.send_line("AWAY")
+
+    @property
+    def away_message(self):
+        return self._away_message
+
+    async def whois(self, nick, timeout=8.0):
+        """Issue a real WHOIS and await the reply (works network-wide)."""
+        key = self.casefold(nick)
+        evt = asyncio.Event()
+        slot = {"data": {"nick": nick}, "event": evt, "found": False}
+        self._whois_pending[key] = slot
+        try:
+            self.send_line("WHOIS", [nick])
+            try:
+                await asyncio.wait_for(evt.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
+            return slot["data"] if slot["found"] else None
+        finally:
+            self._whois_pending.pop(key, None)
+
     def joined_channels(self) -> List[str]:
         try:
             return [getattr(c, "name", k) for k, c in self.server.channels.items()]
@@ -1428,6 +1495,7 @@ class IRCXAdapter(BasePlatformAdapter):
         self._buffers: Dict[str, "Any"] = {}
         self._deque = _deque
         self._last_spontaneous: Dict[str, float] = {}
+        self._ignored = {}
 
     @property
     def name(self) -> str:
@@ -1668,6 +1736,12 @@ class IRCXAdapter(BasePlatformAdapter):
         is_channel = msg["is_channel"]
         target = msg["target"]
         spontaneous = False
+
+        # Temporary mute: drop everything from an ignored nick — not recorded
+        # for context, not answered.  Replayed history is exempt (it predates
+        # the mute and is never answered anyway).
+        if not msg.get("is_history") and self._is_ignored(sender_nick):
+            return
 
         if is_channel:
             # group_policy: in allowlist mode only handle configured channels.
@@ -2061,6 +2135,88 @@ class IRCXAdapter(BasePlatformAdapter):
                 "match_count": len(results), "matches": results}
 
 
+    async def runtime_away(self, message=None):
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        self._client.set_away(message or None)
+        if message:
+            return {"success": True, "away": True, "message": message}
+        return {"success": True, "away": False}
+
+    async def runtime_cycle(self, channel, reason=None):
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not self._client.is_channel(channel):
+            return {"error": "%s is not a channel" % channel}
+        if not self._client.in_channel(channel):
+            return {"error": "not in channel %s" % channel}
+        spec = self._channel_spec(channel)
+        key = spec.key if spec else None
+        self._client.part(channel, reason or "cycling")
+        await asyncio.sleep(0.5)
+        self._client.join(channel, key)
+        return {"success": True, "cycled": channel}
+
+    async def runtime_set_key(self, channel, key=None):
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        if not self._client.is_channel(channel) or not self._client.in_channel(channel):
+            return {"error": "not in channel %s" % channel}
+        if not self._client.am_i_op(channel):
+            return {"error": "cannot set key: the bot is not an operator in %s" % channel}
+        spec = self._channel_spec(channel)
+        if key:
+            if any(c in key for c in (chr(13), chr(10), chr(0), " ", ",")):
+                return {"error": "invalid channel key"}
+            self._client.set_modes(channel, "+k", [key])
+            if spec is not None:
+                spec.key = key
+            return {"success": True, "channel": channel, "key_set": True}
+        else:
+            old = spec.key if spec else None
+            self._client.set_modes(channel, "-k", [old] if old else [])
+            if spec is not None:
+                spec.key = None
+            return {"success": True, "channel": channel, "key_cleared": True}
+
+    async def runtime_whois_server(self, nick):
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        nick = (nick or "").strip()
+        if not nick or any(c in nick for c in (chr(13), chr(10), chr(0), " ")):
+            return {"error": "invalid nick"}
+        data = await self._client.whois(nick)
+        if data is None:
+            return {"error": "%s is not online (or WHOIS timed out)" % nick}
+        return {"success": True, **data}
+
+    async def runtime_ignore(self, nick, seconds=300):
+        if not nick:
+            return {"error": "no nick specified"}
+        try:
+            seconds = max(1, min(int(seconds), 86400))
+        except (TypeError, ValueError):
+            seconds = 300
+        import time as _t
+        self._ignored[nick.lower()] = _t.monotonic() + seconds
+        return {"success": True, "ignored": nick, "seconds": seconds}
+
+    async def runtime_unignore(self, nick):
+        if not nick:
+            return {"error": "no nick specified"}
+        existed = self._ignored.pop(nick.lower(), None) is not None
+        return {"success": True, "nick": nick, "was_ignored": existed}
+
+    def _is_ignored(self, nick):
+        import time as _t
+        exp = self._ignored.get((nick or "").lower())
+        if exp is None:
+            return False
+        if _t.monotonic() >= exp:
+            self._ignored.pop(nick.lower(), None)
+            return False
+        return True
+
 # ===========================================================================
 # Plugin module-level hooks
 # ===========================================================================
@@ -2210,6 +2366,69 @@ def _ircx_search_history_tool(args: dict, **kwargs) -> str:
         str(args.get("channel", "")).strip(),
         str(args.get("sender", "")).strip(),
         args.get("limit", 20)))
+    return json.dumps(res)
+
+
+def _ircx_away_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    message = args.get("message")
+    res = _run_adapter_coro(adapter, adapter.runtime_away(
+        None if message is None else str(message)))
+    return json.dumps(res)
+
+
+def _ircx_cycle_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_cycle(
+        str(args.get("channel", "")).strip(), args.get("reason")))
+    return json.dumps(res)
+
+
+def _ircx_set_key_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    key = args.get("key")
+    res = _run_adapter_coro(adapter, adapter.runtime_set_key(
+        str(args.get("channel", "")).strip(),
+        None if key is None else str(key)))
+    return json.dumps(res)
+
+
+def _ircx_whois_server_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_whois_server(
+        str(args.get("nick", "")).strip()))
+    return json.dumps(res)
+
+
+def _ircx_ignore_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_ignore(
+        str(args.get("nick", "")).strip(), args.get("seconds", 300)))
+    return json.dumps(res)
+
+
+def _ircx_unignore_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_unignore(
+        str(args.get("nick", "")).strip()))
     return json.dumps(res)
 
 
@@ -2431,6 +2650,91 @@ _IRCX_TOOL_SCHEMAS = {
             "required": ["query"],
         },
     },
+    "irc_away": {
+        "name": "irc_away",
+        "description": (
+            "Set or clear the bot's IRC away status. Provide 'message' to mark "
+            "away (signals you're stepping back or degraded — clients show it on "
+            "WHOIS and when someone messages you); omit/empty 'message' to return."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "Away reason. Omit or empty to clear away."},
+            },
+        },
+    },
+    "irc_cycle": {
+        "name": "irc_cycle",
+        "description": (
+            "Part then rejoin a channel to reset desynced state (e.g. after a "
+            "netsplit or lost op status). The channel key is preserved across "
+            "the cycle. The bot must currently be in the channel."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string"},
+                "reason": {"type": "string", "description": "Optional part reason."},
+            },
+            "required": ["channel"],
+        },
+    },
+    "irc_set_key": {
+        "name": "irc_set_key",
+        "description": (
+            "Set or clear a channel key (+k, password to join). Provide 'key' to "
+            "set it; omit/empty 'key' to remove it. Requires the bot to hold "
+            "operator status. The key is remembered so reconnects rejoin with it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string"},
+                "key": {"type": "string", "description": "New key. Omit or empty to clear (-k)."},
+            },
+            "required": ["channel"],
+        },
+    },
+    "irc_whois_server": {
+        "name": "irc_whois_server",
+        "description": (
+            "Network-wide WHOIS lookup of a nick — works even for users the bot "
+            "does NOT share a channel with. Answers 'is X online right now?' and "
+            "returns their account, host, realname, server, idle time and "
+            "channels. Returns an error if the nick is offline."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"nick": {"type": "string"}},
+            "required": ["nick"],
+        },
+    },
+    "irc_ignore": {
+        "name": "irc_ignore",
+        "description": (
+            "Temporarily mute a user: their messages are dropped (not answered, "
+            "not added to context) for a while, then ignoring lapses on its own "
+            "so it doesn't become permanent. Use to let someone cool off."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "nick": {"type": "string"},
+                "seconds": {"type": "integer", "description": "How long to ignore (default 300, max 86400)."},
+            },
+            "required": ["nick"],
+        },
+    },
+    "irc_unignore": {
+        "name": "irc_unignore",
+        "description": "Lift a temporary mute set by irc_ignore before it expires.",
+        "parameters": {
+            "type": "object",
+            "properties": {"nick": {"type": "string"}},
+            "required": ["nick"],
+        },
+    },
 }
 
 def check_requirements() -> bool:
@@ -2649,7 +2953,11 @@ def register(ctx: Any) -> None:
             "irc_join / irc_part / irc_say / irc_list_channels tools to manage "
             "channels when permitted (only join channels when explicitly asked), "
             "and irc_channel_info / irc_whois to see who is in a channel, the "
-            "user/op counts, the topic, and details about a specific user."
+            "user/op counts, the topic, and details about a specific user. "
+            "You can also irc_away to flag stepping back, irc_whois_server to "
+            "check if a nick is online network-wide, irc_cycle to reset a "
+            "desynced channel, irc_set_key to manage a channel password, and "
+            "irc_ignore to briefly mute someone (it lapses on its own)."
         ),
     )
 
@@ -2671,6 +2979,12 @@ def register(ctx: Any) -> None:
             ("irc_kick", _ircx_kick_tool),
             ("irc_accounts_online", _ircx_accounts_online_tool),
             ("irc_search_history", _ircx_search_history_tool),
+            ("irc_away", _ircx_away_tool),
+            ("irc_cycle", _ircx_cycle_tool),
+            ("irc_set_key", _ircx_set_key_tool),
+            ("irc_whois_server", _ircx_whois_server_tool),
+            ("irc_ignore", _ircx_ignore_tool),
+            ("irc_unignore", _ircx_unignore_tool),
         ):
             try:
                 _register(

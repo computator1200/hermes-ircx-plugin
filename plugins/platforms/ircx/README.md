@@ -215,6 +215,26 @@ These read directly from the `ircstates` state machine (NAMES/`353`, WHO, MODE,
 TOPIC) — no extra round-trips in the common case. The bot must be a *member* of
 a channel to see its roster.
 
+### Self-management & participation (agent tools)
+Further `ircx`-toolset tools give the agent the same everyday agency a human
+IRC user has. None need `allow_agent_join`; the channel-state-changing ones
+(`irc_set_key`) enforce that the bot itself holds operator status, exactly like
+`irc_mode` / `irc_topic` / `irc_kick`.
+
+- `irc_away` — set or clear the bot's away status (signals "stepping back" /
+  degraded state; visible on WHOIS).
+- `irc_whois_server` — a **network-wide** WHOIS that works even for users the
+  bot shares no channel with. Answers "is X online right now?" with their
+  account, host, realname, server, idle time and channels (async request/reply
+  on numerics 311/312/313/317/319/330/671/318, with a timeout).
+- `irc_cycle` — part then rejoin a channel to reset desynced state after a
+  netsplit or lost op; the channel key is preserved across the cycle.
+- `irc_set_key` — first-class channel-key (`+k`) management; the key is
+  remembered so reconnects rejoin with it. Requires the bot to be an operator.
+- `irc_ignore` / `irc_unignore` — temporarily mute a user: their messages are
+  dropped (not answered, not buffered for context) until the timeout lapses,
+  so it can't become permanent avoidance. Default 300 s, max 86400 s.
+
 ### Downtime context persistence
 IRC is stateless, but the **agent's own conversation memory persists** in
 Hermes' state DB across reconnects/restarts. What's missed is channel traffic
