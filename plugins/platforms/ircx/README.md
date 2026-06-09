@@ -215,6 +215,16 @@ These read directly from the `ircstates` state machine (NAMES/`353`, WHO, MODE,
 TOPIC) — no extra round-trips in the common case. The bot must be a *member* of
 a channel to see its roster.
 
+### Channel membership events (who comes and goes)
+With `IRCX_SHOW_EVENTS=true` (default off), the bot surfaces **join / part /
+quit / kick / nick-change** events into the per-channel context buffer (and the
+on-disk log), so the agent can *see* who's coming and going — e.g. to greet a
+returning friend or notice someone left. Events are recorded as plain context
+lines (`*** alice has joined #chan`); they are **never dispatched as a prompt**
+on their own (no reply storms), and the bot's own joins/parts are skipped.
+Quits and nick-changes are attributed to every channel the user shared with the
+bot. Noisy on large channels — leave it off there. Env: `IRCX_SHOW_EVENTS`.
+
 ### Self-management & participation (agent tools)
 Further `ircx`-toolset tools give the agent the same everyday agency a human
 IRC user has. None need `allow_agent_join`; the channel-state-changing ones

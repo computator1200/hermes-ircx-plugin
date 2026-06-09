@@ -35,8 +35,18 @@ def make_client(**over):
 async def feed(client, *lines):
     for raw in lines:
         for line in client.server.recv((raw + "\r\n").encode()):
+            # Mirror _recv_loop: snapshot shared channels before parse_tokens
+            # removes/renames the user (for QUIT/NICK event context).
+            pre_channels = None
+            try:
+                if line.command.upper() in ("QUIT", "NICK"):
+                    src = line.hostmask.nickname if line.hostmask else (
+                        line.source.split("!", 1)[0] if line.source else "")
+                    pre_channels = client._user_shared_channels(src)
+            except Exception:
+                pre_channels = None
             client.server.parse_tokens(line)
-            await client._handle_line(line)
+            await client._handle_line(line, pre_channels=pre_channels)
 
 
 def drain(client):
@@ -770,3 +780,94 @@ class TestAgencyWishlist2:
         for t in ("irc_away", "irc_cycle", "irc_set_key", "irc_whois_server",
                   "irc_ignore", "irc_unignore"):
             assert t in captured
+
+
+# ---------------------------------------------------------------------------
+# Membership events: join / part / quit / kick / nick visibility in context
+# ---------------------------------------------------------------------------
+
+async def _join_chan(client, chan, *nicks):
+    """Put the bot + given nicks into a channel via NAMES."""
+    roster = "hermesx " + " ".join(nicks)
+    await feed(
+        client,
+        f":hermesx!u@h JOIN {chan}",
+        f":srv 353 hermesx = {chan} :{roster}",
+        f":srv 366 hermesx {chan} :end",
+    )
+
+
+class TestMembershipEvents:
+    @pytest.mark.asyncio
+    async def test_join_recorded_to_context(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, show_events=True)
+        await _join_chan(client, "#chan")
+        await feed(client, ":alice!a@h JOIN #chan")
+        assert any("alice has joined #chan" in l for l in adapter._buf("#chan"))
+        adapter.handle_message.assert_not_called()  # never dispatched as a prompt
+
+    @pytest.mark.asyncio
+    async def test_part_recorded_with_reason(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, show_events=True)
+        await _join_chan(client, "#chan", "alice")
+        await feed(client, ":alice!a@h PART #chan :brb")
+        assert any("alice has left #chan (brb)" in l for l in adapter._buf("#chan"))
+
+    @pytest.mark.asyncio
+    async def test_quit_recorded_to_all_shared_channels(self, monkeypatch):
+        adapter, client = await make_adapter(
+            monkeypatch, show_events=True,
+            channels=[ChannelSpec("#chan"), ChannelSpec("#ops")])
+        await _join_chan(client, "#chan", "alice")
+        await _join_chan(client, "#ops", "alice")
+        await feed(client, ":alice!a@h QUIT :leaving")
+        assert any("alice has quit IRC (leaving)" in l for l in adapter._buf("#chan"))
+        assert any("alice has quit IRC (leaving)" in l for l in adapter._buf("#ops"))
+
+    @pytest.mark.asyncio
+    async def test_nick_change_recorded(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, show_events=True)
+        await _join_chan(client, "#chan", "alice")
+        await feed(client, ":alice!a@h NICK alice2")
+        assert any("alice is now known as alice2" in l for l in adapter._buf("#chan"))
+
+    @pytest.mark.asyncio
+    async def test_kick_recorded(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, show_events=True)
+        await _join_chan(client, "#chan", "bob")
+        await feed(client, ":alice!a@h KICK #chan bob :spam")
+        assert any("bob was kicked from #chan by alice (spam)" in l
+                   for l in adapter._buf("#chan"))
+
+    @pytest.mark.asyncio
+    async def test_own_join_not_recorded(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, show_events=True)
+        await _join_chan(client, "#chan")  # includes the bot's own JOIN
+        assert not any("hermesx has joined" in l for l in adapter._buf("#chan"))
+
+    @pytest.mark.asyncio
+    async def test_disabled_by_default(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch)  # show_events defaults off
+        await _join_chan(client, "#chan")
+        await feed(client, ":alice!a@h JOIN #chan")
+        assert not any("alice has joined" in l for l in adapter._buf("#chan"))
+
+    @pytest.mark.asyncio
+    async def test_event_appears_in_formatted_context(self, monkeypatch):
+        adapter, client = await make_adapter(monkeypatch, show_events=True,
+                                             require_mention=False)
+        await _join_chan(client, "#chan", "alice")
+        await feed(client, ":alice!a@h JOIN #chan")  # recorded as event
+        # a later real message triggers a turn; the join should be in context
+        await adapter._on_irc_message(cmsg(sender_nick="alice", text="hello"))
+        ctx = adapter._format_context("#chan")
+        assert ctx and "alice has joined #chan" in ctx
+
+    def test_show_events_config_flag(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_SERVER", "s")
+        monkeypatch.setenv("IRCX_CHANNEL", "#c")
+        monkeypatch.setenv("IRCX_SHOW_EVENTS", "true")
+        from gateway.config import PlatformConfig
+        cfg = ircx.load_config(PlatformConfig())
+        assert cfg.show_events is True

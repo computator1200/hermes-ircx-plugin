@@ -1,7 +1,7 @@
 name: ircx-platform
 label: IRC
 kind: platform
-version: 1.3.0
+version: 1.4.0
 description: >
   Full-featured IRCv3 gateway adapter for Hermes Agent.  Connects to one or
   more IRC channels (and DMs) and relays messages to/from the Hermes agent.
@@ -130,6 +130,10 @@ optional_env:
   - name: IRCX_CONTEXT_BUFFER
     description: "Recent channel lines kept per channel for context injection (default: 15)."
     prompt: "Context buffer size"
+    password: false
+  - name: IRCX_SHOW_EVENTS
+    description: "Surface channel membership events (joins/parts/quits/kicks/nick changes) into the agent's channel context, so it can see who comes and goes. Default: false."
+    prompt: "Show join/part events? (true/false)"
     password: false
   # ── Runtime channel agency (agent tools) ──
   - name: IRCX_ALLOW_AGENT_JOIN

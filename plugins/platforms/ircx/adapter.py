@@ -215,6 +215,7 @@ class IRCXConfig:
     spontaneous_probability: float = 0.0  # 0..1 chance to chime in unprompted
     spontaneous_cooldown: float = 90.0    # min seconds between spontaneous posts/chan
     context_buffer_size: int = 15         # recent lines kept per channel for context
+    show_events: bool = False             # surface join/part/quit/kick/nick to context
 
     # --- Runtime agency tools (Feature B) ---
     allow_agent_join: bool = False        # let the agent JOIN/PART at runtime
@@ -421,6 +422,8 @@ def load_config(platform_config: Any) -> IRCXConfig:
         cfg.context_buffer_size = max(0, int(cbs)) if cbs is not None else 15
     except (TypeError, ValueError):
         cfg.context_buffer_size = 15
+    ev_env = _env("IRCX_SHOW_EVENTS")
+    cfg.show_events = _truthy(ev_env) if ev_env is not None else bool(extra.get("show_events", False))
 
     # --- Feature B: runtime agency ---
     aj_env = _env("IRCX_ALLOW_AGENT_JOIN")
@@ -915,12 +918,22 @@ class IRCClient:
                 self._last_rx = asyncio.get_running_loop().time()
                 self._awaiting_pong = False
                 for line in self.server.recv(data):
+                    # QUIT/NICK remove or rename the user in parse_tokens below,
+                    # so snapshot their shared channels first (for event context).
+                    pre_channels = None
+                    try:
+                        if self.cfg.show_events and line.command.upper() in ("QUIT", "NICK"):
+                            _src = line.hostmask.nickname if line.hostmask else (
+                                line.source.split("!", 1)[0] if line.source else "")
+                            pre_channels = self._user_shared_channels(_src)
+                    except Exception:
+                        pre_channels = None
                     try:
                         self.server.parse_tokens(line)
                     except Exception as exc:  # pragma: no cover
                         logger.debug("IRCX state parse error: %s", exc)
                     try:
-                        await self._handle_line(line)
+                        await self._handle_line(line, pre_channels=pre_channels)
                     except Exception as exc:
                         logger.warning("IRCX line handler error on %s: %s", line.command, exc)
         except asyncio.CancelledError:
@@ -963,7 +976,7 @@ class IRCClient:
 
     # ---- protocol dispatch -----------------------------------------------
 
-    async def _handle_line(self, line: Any) -> None:
+    async def _handle_line(self, line: Any, pre_channels: Optional[List[str]] = None) -> None:
         command = line.command.upper()
 
         if command == "PING":
@@ -1005,6 +1018,13 @@ class IRCClient:
 
         if command in ("PRIVMSG", "NOTICE"):
             await self._handle_privmsg(line, is_notice=(command == "NOTICE"))
+            return
+
+        # Membership events (join/part/quit/kick/nick) — surfaced to the agent's
+        # channel context when show_events is on. ircstates has already updated
+        # state in parse_tokens; we only narrate.
+        if self.cfg.show_events and command in ("JOIN", "PART", "QUIT", "KICK", "NICK"):
+            await self._handle_membership_event(command, line, pre_channels)
             return
 
         # WHOIS reply numerics -> fulfil a pending whois() future.
@@ -1059,6 +1079,92 @@ class IRCClient:
             slot["event"].set()
         elif command == "318":
             slot["event"].set()
+
+    def _user_shared_channels(self, nick: str) -> List[str]:
+        """Channels (display names) the given user currently shares with us.
+
+        Read from ircstates *before* a QUIT/NICK is parsed, so we know which
+        channel contexts the event belongs to.
+        """
+        try:
+            u = self.server.users.get(self.casefold(nick))
+            if not u:
+                return []
+            out = []
+            for ch_cf in getattr(u, "channels", set()) or set():
+                ch = self.server.channels.get(ch_cf)
+                out.append(getattr(ch, "name", ch_cf) if ch else ch_cf)
+            return out
+        except Exception:
+            return []
+
+    async def _handle_membership_event(self, command: str, line: Any,
+                                       pre_channels: Optional[List[str]]) -> None:
+        actor = line.hostmask.nickname if line.hostmask else (
+            line.source.split("!", 1)[0] if line.source else "")
+        if not actor:
+            return
+        params = line.params
+        server_time = line.tags.get("time") if line.tags else None
+        batch_ref = line.tags.get("batch") if line.tags else None
+        is_history = bool(batch_ref and batch_ref in self._chathistory_batches)
+        is_self = self.casefold_equals(actor, self.current_nick)
+
+        if command == "JOIN":
+            if is_self:
+                return  # don't narrate our own joins
+            channel = params[0] if params else ""
+            if channel:
+                await self._emit_event(channel, f"*** {actor} has joined {channel}",
+                                       server_time, is_history)
+        elif command == "PART":
+            if is_self:
+                return
+            channel = params[0] if params else ""
+            reason = params[1] if len(params) > 1 else ""
+            if channel:
+                text = f"*** {actor} has left {channel}" + (f" ({reason})" if reason else "")
+                await self._emit_event(channel, text, server_time, is_history)
+        elif command == "KICK":
+            channel = params[0] if params else ""
+            target = params[1] if len(params) > 1 else ""
+            reason = params[2] if len(params) > 2 else ""
+            if channel and target:
+                text = (f"*** {target} was kicked from {channel} by {actor}"
+                        + (f" ({reason})" if reason else ""))
+                await self._emit_event(channel, text, server_time, is_history)
+        elif command == "QUIT":
+            if is_self:
+                return
+            reason = params[0] if params else ""
+            text = f"*** {actor} has quit IRC" + (f" ({reason})" if reason else "")
+            for channel in (pre_channels or []):
+                await self._emit_event(channel, text, server_time, is_history)
+        elif command == "NICK":
+            new_nick = params[0] if params else ""
+            if not new_nick or self.casefold_equals(new_nick, self.current_nick):
+                return  # our own rename: parse_tokens already set current_nick
+            text = f"*** {actor} is now known as {new_nick}"
+            for channel in (pre_channels or []):
+                await self._emit_event(channel, text, server_time, is_history)
+
+    async def _emit_event(self, channel: str, text: str,
+                          server_time: Optional[str], is_history: bool) -> None:
+        if not self.is_channel(channel):
+            return
+        await self._on_message({
+            "type": "event",
+            "sender_nick": "*",
+            "account": None,
+            "target": channel,
+            "text": text,
+            "is_notice": False,
+            "is_channel": True,
+            "msgid": None,
+            "server_time": server_time,
+            "is_history": is_history,
+            "tags": {},
+        })
 
     async def _request_chathistory(self, channel: str) -> None:
         """Fetch recent backlog on (re)join where the server supports it."""
@@ -1528,6 +1634,34 @@ class IRCXAdapter(BasePlatformAdapter):
             # fall back to a direct write — there's no loop to block.
             _write_log_line(path, line)
 
+    def _record_event_msg(self, msg: Dict[str, Any]) -> None:
+        """Record a membership event into the channel's context buffer."""
+        if not self.cfg.show_events:
+            return
+        target = msg.get("target")
+        text = msg.get("text") or ""
+        if not target or not text:
+            return
+        # Respect allowlist group policy, same as messages.
+        if self.cfg.group_policy == "allowlist" and self._channel_spec(target) is None:
+            return
+        self._record_event(target, text)
+
+    def _record_event(self, chat_id: str, text: str) -> None:
+        """Append a pre-formatted event line (e.g. '*** X has joined') to the
+        rolling context buffer (and the on-disk log), with no 'sender:' prefix."""
+        self._buf(chat_id).append(text)
+        path = self._log_path(chat_id)
+        if not path:
+            return
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        line = f"{ts}\t*\t{text}\n"
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, _write_log_line, path, line)
+        except RuntimeError:
+            _write_log_line(path, line)
+
     def _format_context(self, chat_id: str) -> Optional[str]:
         buf = self._buffers.get(self._client.casefold(chat_id) if self._client else chat_id.lower())
         if not buf:
@@ -1726,6 +1860,11 @@ class IRCXAdapter(BasePlatformAdapter):
     # ---- inbound dispatch -------------------------------------------------
 
     async def _on_irc_message(self, msg: Dict[str, Any]) -> None:
+        # Membership events: record to channel context only, never dispatch to
+        # the agent as a prompt (pure visibility).
+        if msg.get("type") == "event":
+            self._record_event_msg(msg)
+            return
         if not self._message_handler:
             return
         if msg["is_notice"]:
