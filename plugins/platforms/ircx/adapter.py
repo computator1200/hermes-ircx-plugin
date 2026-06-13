@@ -728,6 +728,7 @@ class IRCClient:
         self._chathistory_batches: set = set()
         self._away_message = None
         self._whois_pending = {}
+        self._reply_captures = {}  # casefold(nick) -> capture slot for irc_query
 
     # ---- public properties ----------------------------------------------
 
@@ -1342,6 +1343,15 @@ class IRCClient:
         if self.casefold_equals(sender_nick, self.current_nick):
             return
 
+        # irc_query reply capture: services (NickServ/ChanServ/…) answer by
+        # private NOTICE, which is otherwise dropped. If a query() is awaiting a
+        # reply from this sender, collect the line (PRIVMSG or NOTICE) for it.
+        if not self.is_channel(target):
+            cap = self._reply_captures.get(self.casefold(sender_nick))
+            if cap is not None and not text.startswith("\x01"):
+                cap["lines"].append(text)
+                cap["event"].set()
+
         # CTCP handling.
         if text.startswith("\x01"):
             handled = await self._handle_ctcp(sender_nick, target, text, is_notice=is_notice)
@@ -1492,6 +1502,36 @@ class IRCClient:
             return slot["data"] if slot["found"] else None
         finally:
             self._whois_pending.pop(key, None)
+
+    async def query(self, target, text, timeout=8.0, quiet=1.5):
+        """PM *target* (a service/bot/nick) and collect its private replies.
+
+        Services answer by NOTICE, which the normal prompt path drops; this
+        captures both NOTICE and PRIVMSG replies from ``target`` until ``quiet``
+        seconds pass with no new line (multi-line replies) or ``timeout`` total.
+        """
+        key = self.casefold(target)
+        slot = {"lines": [], "event": asyncio.Event()}
+        self._reply_captures[key] = slot
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        try:
+            self.privmsg(target, text)
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                slot["event"].clear()
+                wait = min(remaining, quiet) if slot["lines"] else remaining
+                try:
+                    await asyncio.wait_for(slot["event"].wait(), timeout=wait)
+                except asyncio.TimeoutError:
+                    if slot["lines"]:
+                        break  # quiet period elapsed after a reply — done
+                    break      # nothing arrived within the timeout
+            return list(slot["lines"])
+        finally:
+            self._reply_captures.pop(key, None)
 
     def joined_channels(self) -> List[str]:
         try:
@@ -2348,6 +2388,24 @@ class IRCXAdapter(BasePlatformAdapter):
             return {"error": "%s is not online (or WHOIS timed out)" % nick}
         return {"success": True, **data}
 
+    async def runtime_query(self, target, text, timeout=8.0):
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        target = (target or "").strip()
+        if not target or any(c in target for c in (chr(13), chr(10), chr(0), " ")):
+            return {"error": "invalid target"}
+        if not text:
+            return {"error": "no message text"}
+        try:
+            timeout = max(1.0, min(float(timeout), 30.0))
+        except (TypeError, ValueError):
+            timeout = 8.0
+        replies = await self._client.query(target, str(text), timeout=timeout)
+        if not replies:
+            return {"success": True, "target": target, "replies": [],
+                    "note": "no reply within %.0fs (target may be offline or silent)" % timeout}
+        return {"success": True, "target": target, "replies": replies}
+
     async def runtime_ignore(self, nick, seconds=300):
         if not nick:
             return {"error": "no nick specified"}
@@ -2567,6 +2625,18 @@ def _ircx_whois_server_tool(args: dict, **kwargs) -> str:
         return json.dumps({"error": "IRC not connected in this process"})
     res = _run_adapter_coro(adapter, adapter.runtime_whois_server(
         str(args.get("nick", "")).strip()))
+    return json.dumps(res)
+
+
+def _ircx_query_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_query(
+        str(args.get("target", "")).strip(),
+        str(args.get("text", "")),
+        args.get("timeout", 8.0)), timeout=40.0)
     return json.dumps(res)
 
 
@@ -2868,6 +2938,25 @@ _IRCX_TOOL_SCHEMAS = {
             "required": ["nick"],
         },
     },
+    "irc_query": {
+        "name": "irc_query",
+        "description": (
+            "Send a private message to a service or bot (e.g. NickServ, ChanServ, "
+            "MemoServ, or any bot nick) and return its reply — including NOTICE "
+            "replies, which services use and which normal messages never surface. "
+            "Use this to drive IRC services: register/manage channels, send memos, "
+            "check INFO, etc. Returns the reply lines (often multi-line)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Service/bot/nick to message, e.g. NickServ."},
+                "text": {"type": "string", "description": "The command/message, e.g. 'INFO #pascal-ops'."},
+                "timeout": {"type": "number", "description": "Seconds to wait for the reply (default 8, max 30)."},
+            },
+            "required": ["target", "text"],
+        },
+    },
     "irc_ignore": {
         "name": "irc_ignore",
         "description": (
@@ -3115,7 +3204,10 @@ def register(ctx: Any) -> None:
             "You can also irc_away to flag stepping back, irc_whois_server to "
             "check if a nick is online network-wide, irc_cycle to reset a "
             "desynced channel, irc_set_key to manage a channel password, and "
-            "irc_ignore to briefly mute someone (it lapses on its own)."
+            "irc_ignore to briefly mute someone (it lapses on its own). To talk "
+            "to IRC services or bots (NickServ, ChanServ, MemoServ, etc.) use "
+            "irc_query — it sends them a message and returns their reply "
+            "(including NOTICE replies, which you otherwise can't see)."
         ),
     )
 
@@ -3141,6 +3233,7 @@ def register(ctx: Any) -> None:
             ("irc_cycle", _ircx_cycle_tool),
             ("irc_set_key", _ircx_set_key_tool),
             ("irc_whois_server", _ircx_whois_server_tool),
+            ("irc_query", _ircx_query_tool),
             ("irc_ignore", _ircx_ignore_tool),
             ("irc_unignore", _ircx_unignore_tool),
         ):

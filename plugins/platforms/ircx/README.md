@@ -247,6 +247,12 @@ IRC user has. None need `allow_agent_join`; the channel-state-changing ones
 - `irc_ignore` / `irc_unignore` — temporarily mute a user: their messages are
   dropped (not answered, not buffered for context) until the timeout lapses,
   so it can't become permanent avoidance. Default 300 s, max 86400 s.
+- `irc_query` — message an IRC **service or bot** (NickServ, ChanServ, MemoServ,
+  or any bot nick) and get its reply back. Services answer by `NOTICE`, which the
+  normal prompt path drops for loop-safety, so without this the agent is "talking
+  blind." `irc_query` captures the reply (NOTICE *and* PRIVMSG, multi-line) for a
+  short window and returns it — letting the agent actually drive services
+  (register/manage channels, send memos, read INFO) and command bots.
 
 ### Downtime context persistence
 IRC is stateless, but the **agent's own conversation memory persists** in

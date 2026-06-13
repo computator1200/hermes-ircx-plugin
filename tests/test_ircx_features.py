@@ -919,3 +919,71 @@ class TestBlockedChannels:
         from gateway.config import PlatformConfig
         cfg = ircx.load_config(PlatformConfig())
         assert [c.lower() for c in cfg.blocked_channels] == ["#a", "#b"]
+
+
+# ---------------------------------------------------------------------------
+# irc_query — drive services/bots and capture their (NOTICE) replies
+# ---------------------------------------------------------------------------
+
+class TestServiceQuery:
+    @pytest.mark.asyncio
+    async def test_query_captures_notice_and_privmsg(self, monkeypatch):
+        import asyncio
+        client, _ = make_client(nickname="hermesx")
+        await feed(client, ":srv 001 hermesx :hi")
+        task = asyncio.create_task(client.query("NickServ", "INFO x", timeout=2, quiet=0.2))
+        await asyncio.sleep(0)  # let it send + register the capture slot
+        assert any(l.startswith("PRIVMSG NickServ :INFO x") for l in drain(client))
+        await feed(
+            client,
+            ":NickServ!s@srv NOTICE hermesx :Information on x",
+            ":NickServ!s@srv NOTICE hermesx :Registered: yes",
+        )
+        replies = await task
+        assert any("Information on x" in r for r in replies)
+        assert any("Registered: yes" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_query_timeout_returns_empty(self, monkeypatch):
+        client, _ = make_client(nickname="hermesx")
+        await feed(client, ":srv 001 hermesx :hi")
+        replies = await client.query("Nobody", "ping", timeout=0.3, quiet=0.1)
+        assert replies == []
+
+    @pytest.mark.asyncio
+    async def test_query_ignores_channel_messages(self, monkeypatch):
+        import asyncio
+        client, _ = make_client(nickname="hermesx")
+        await feed(client, ":srv 001 hermesx :hi")
+        task = asyncio.create_task(client.query("BotServ", "help", timeout=1.5, quiet=0.2))
+        await asyncio.sleep(0)
+        drain(client)
+        # a channel message from the target must NOT be captured (only private)
+        await feed(client, ":BotServ!s@srv PRIVMSG #chan :channel chatter")
+        await feed(client, ":BotServ!s@srv NOTICE hermesx :private reply")
+        replies = await task
+        assert any("private reply" in r for r in replies)
+        assert not any("channel chatter" in r for r in replies)
+
+    @pytest.mark.asyncio
+    async def test_runtime_query_formats_and_validates(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        adapter, client = await make_adapter(monkeypatch)
+        adapter._mark_connected()
+        client.query = AsyncMock(return_value=["#x is registered", "Founder: pascal"])
+        res = await adapter.runtime_query("ChanServ", "INFO #x")
+        assert res.get("success") and res["replies"][0] == "#x is registered"
+        client.query = AsyncMock(return_value=[])
+        empty = await adapter.runtime_query("ChanServ", "INFO #x")
+        assert empty.get("success") and empty["replies"] == [] and "note" in empty
+        assert "error" in await adapter.runtime_query("", "hi")          # no target
+        assert "error" in await adapter.runtime_query("ChanServ", "")    # no text
+        assert "error" in await adapter.runtime_query("bad nick", "hi")  # space in target
+
+    def test_query_tool_registered(self):
+        captured = []
+        class Ctx:
+            def register_platform(self, **kw): pass
+            def register_tool(self, **kw): captured.append(kw["name"])
+        ircx.register(Ctx())
+        assert "irc_query" in captured
