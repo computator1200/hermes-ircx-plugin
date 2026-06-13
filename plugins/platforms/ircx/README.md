@@ -195,7 +195,10 @@ When `allow_agent_join: true`, the agent gets four tools (toolset `ircx`):
 `irc_join`, `irc_part`, `irc_say`, `irc_list_channels`. It can join/leave
 channels and speak in any channel it has joined, on request. Joins are gated by
 the `IRCX_JOINABLE_CHANNELS` allowlist (empty = any) and joined channels persist
-across reconnects. `irc_say` only targets channels the bot is actually in (or a
+across reconnects. **`IRCX_BLOCKED_CHANNELS`** is a denylist that **always wins**:
+a blocked channel is never auto-joined (even if in `IRCX_CHANNEL`), never joined
+on request (even if a user asks or it's in the allowlist), and never answered in
+(messages there are dropped). Use it to permanently ban a costly/public channel. `irc_say` only targets channels the bot is actually in (or a
 nick for a DM). Disabled by default. Env: `IRCX_ALLOW_AGENT_JOIN`,
 `IRCX_JOINABLE_CHANNELS`. Keep `IRCX_ALLOWED_USERS` tight when enabling this so
 only trusted operators can direct joins.

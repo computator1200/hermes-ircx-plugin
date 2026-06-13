@@ -871,3 +871,51 @@ class TestMembershipEvents:
         from gateway.config import PlatformConfig
         cfg = ircx.load_config(PlatformConfig())
         assert cfg.show_events is True
+
+
+# ---------------------------------------------------------------------------
+# Blocked-channels denylist (IRCX_BLOCKED_CHANNELS) — never join, even on request
+# ---------------------------------------------------------------------------
+
+class TestBlockedChannels:
+    def test_blocked_not_auto_joined(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_SERVER", "s")
+        monkeypatch.setenv("IRCX_CHANNEL", "#keep,#World-Chat")
+        monkeypatch.setenv("IRCX_BLOCKED_CHANNELS", "#world-chat")
+        from gateway.config import PlatformConfig
+        cfg = ircx.load_config(PlatformConfig())
+        names = [c.name.lower() for c in cfg.channels]
+        assert "#keep" in names and "#world-chat" not in names  # filtered from auto-join
+
+    @pytest.mark.asyncio
+    async def test_join_blocked_rejected_even_when_allowlisted(self, monkeypatch):
+        adapter, client = await make_adapter(
+            monkeypatch, allow_agent_join=True,
+            joinable_channels=["#ok", "#world-chat"],   # blocked wins over allowlist
+            blocked_channels=["#World-Chat"])
+        adapter._mark_connected()
+        res = await adapter.runtime_join("#World-Chat")
+        assert "error" in res and "denylist" in res["error"]
+        ok = await adapter.runtime_join("#ok")
+        assert ok.get("success")
+
+    @pytest.mark.asyncio
+    async def test_blocked_channel_messages_dropped(self, monkeypatch):
+        adapter, _ = await make_adapter(
+            monkeypatch, require_mention=False,
+            channels=[ChannelSpec("#world-chat")],
+            blocked_channels=["#World-Chat"])
+        adapter._mark_connected()
+        await adapter._on_irc_message(cmsg(target="#world-chat", text="costly chatter"))
+        adapter.handle_message.assert_not_called()        # never answered
+        assert not any("costly chatter" in l for l in adapter._buf("#world-chat"))  # not buffered
+
+    def test_blocked_config_flag(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_SERVER", "s")
+        monkeypatch.setenv("IRCX_CHANNEL", "#c")
+        monkeypatch.setenv("IRCX_BLOCKED_CHANNELS", "#a, #b")
+        from gateway.config import PlatformConfig
+        cfg = ircx.load_config(PlatformConfig())
+        assert [c.lower() for c in cfg.blocked_channels] == ["#a", "#b"]

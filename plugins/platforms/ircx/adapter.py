@@ -220,6 +220,7 @@ class IRCXConfig:
     # --- Runtime agency tools (Feature B) ---
     allow_agent_join: bool = False        # let the agent JOIN/PART at runtime
     joinable_channels: List[str] = field(default_factory=list)  # empty = any
+    blocked_channels: List[str] = field(default_factory=list)   # denylist; always wins
     allow_agent_kick: bool = False        # let the agent KICK (still needs to be a channel op)
 
     # --- Context persistence across disconnects (Feature C) ---
@@ -429,6 +430,11 @@ def load_config(platform_config: Any) -> IRCXConfig:
     aj_env = _env("IRCX_ALLOW_AGENT_JOIN")
     cfg.allow_agent_join = _truthy(aj_env) if aj_env is not None else bool(extra.get("allow_agent_join", False))
     cfg.joinable_channels = _coerce_str_list(_env("IRCX_JOINABLE_CHANNELS") or extra.get("joinable_channels"))
+    cfg.blocked_channels = _coerce_str_list(_env("IRCX_BLOCKED_CHANNELS") or extra.get("blocked_channels"))
+    # A blocked channel is never auto-joined, even if listed in IRCX_CHANNEL.
+    if cfg.blocked_channels:
+        _blk = {c.lower() for c in cfg.blocked_channels}
+        cfg.channels = [c for c in cfg.channels if c.name.lower() not in _blk]
     ak_env = _env("IRCX_ALLOW_AGENT_KICK")
     cfg.allow_agent_kick = _truthy(ak_env) if ak_env is not None else bool(extra.get("allow_agent_kick", False))
 
@@ -1883,6 +1889,10 @@ class IRCXAdapter(BasePlatformAdapter):
             return
 
         if is_channel:
+            # Denylist: never engage in a blocked channel — not recorded, not
+            # answered — even if the bot somehow ends up in it (e.g. forced join).
+            if self._is_blocked_channel(target):
+                return
             # group_policy: in allowlist mode only handle configured channels.
             if self.cfg.group_policy == "allowlist" and self._channel_spec(target) is None:
                 return
@@ -2046,6 +2056,12 @@ class IRCXAdapter(BasePlatformAdapter):
 
     # ---- runtime agency, driven by agent tools (Feature B) ---------------
 
+    def _is_blocked_channel(self, channel: str) -> bool:
+        """True if *channel* is on the IRCX_BLOCKED_CHANNELS denylist."""
+        if not self.cfg.blocked_channels or not channel:
+            return False
+        return channel.lower() in {c.lower() for c in self.cfg.blocked_channels}
+
     def _join_allowed(self, channel: str) -> Optional[str]:
         """Return an error string if joining *channel* isn't permitted."""
         if not self.cfg.allow_agent_join:
@@ -2054,6 +2070,9 @@ class IRCXAdapter(BasePlatformAdapter):
             return f"invalid channel name: {channel!r}"
         if any(c in channel for c in ("\r", "\n", "\x00", " ")):
             return "channel name contains illegal characters"
+        # Denylist wins over everything — never join a blocked channel, even on request.
+        if self._is_blocked_channel(channel):
+            return f"{channel} is on the IRCX_BLOCKED_CHANNELS denylist"
         if self.cfg.joinable_channels:
             allowed = {c.lower() for c in self.cfg.joinable_channels}
             if channel.lower() not in allowed:

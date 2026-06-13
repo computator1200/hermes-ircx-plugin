@@ -1,7 +1,7 @@
 name: ircx-platform
 label: IRC
 kind: platform
-version: 1.4.0
+version: 1.5.0
 description: >
   Full-featured IRCv3 gateway adapter for Hermes Agent.  Connects to one or
   more IRC channels (and DMs) and relays messages to/from the Hermes agent.
@@ -143,6 +143,10 @@ optional_env:
   - name: IRCX_JOINABLE_CHANNELS
     description: "Comma-separated allowlist of channels the agent may join (empty = any, when agent-join is enabled)."
     prompt: "Joinable channels (comma-separated)"
+    password: false
+  - name: IRCX_BLOCKED_CHANNELS
+    description: "Comma-separated denylist of channels the bot must NEVER join — wins over everything (auto-join, agent join-on-request, even an allowlist). It is also never auto-joined and never answered in. Use to permanently ban a channel (e.g. a costly public one)."
+    prompt: "Blocked channels (comma-separated)"
     password: false
   # ── Context persistence across disconnects ──
   - name: IRCX_LOG_DIR
