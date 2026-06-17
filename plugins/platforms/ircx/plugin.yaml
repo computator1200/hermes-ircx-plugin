@@ -1,7 +1,7 @@
 name: ircx-platform
 label: IRC
 kind: platform
-version: 1.6.0
+version: 1.7.0
 description: >
   Full-featured IRCv3 gateway adapter for Hermes Agent.  Connects to one or
   more IRC channels (and DMs) and relays messages to/from the Hermes agent.
@@ -34,6 +34,17 @@ requires_env:
     prompt: "Bot nickname"
     password: false
 optional_env:
+  - name: IRCX_NETWORKS
+    description: >
+      Comma-separated list of ADDITIONAL IRC networks to run in the same gateway
+      (sharing the agent's memory/context). Each name <N> registers a platform
+      'ircx-<n>' configured from its own env namespace IRCX_<N>_* (e.g.
+      IRCX_NETWORKS=libera reads IRCX_LIBERA_SERVER, IRCX_LIBERA_NICKNAME,
+      IRCX_LIBERA_CHANNEL, IRCX_LIBERA_SASL_*, etc.). The primary network stays on
+      the unprefixed IRCX_* vars. Tools act on whichever network the agent was
+      addressed in. Empty = single network.
+    prompt: "Additional IRC networks (comma-separated)"
+    password: false
   - name: IRCX_PORT
     description: "IRC server port (default: 6697 with TLS, 6667 without). Falls back to IRC_PORT."
     prompt: "IRC port"

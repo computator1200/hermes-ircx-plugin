@@ -987,3 +987,75 @@ class TestServiceQuery:
             def register_tool(self, **kw): captured.append(kw["name"])
         ircx.register(Ctx())
         assert "irc_query" in captured
+
+
+# ---------------------------------------------------------------------------
+# Multi-network: one gateway, several IRC networks (shared memory)
+# ---------------------------------------------------------------------------
+
+class TestMultiNetwork:
+    def test_secondary_prefix_reads_isolated_env(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_SERVER", "rizon.example")
+        monkeypatch.setenv("IRCX_NICKNAME", "pascal")
+        monkeypatch.setenv("IRCX_CHANNEL", "#a")
+        monkeypatch.setenv("IRCX_LIBERA_SERVER", "127.0.0.1")
+        monkeypatch.setenv("IRCX_LIBERA_NICKNAME", "Tulapascal")
+        monkeypatch.setenv("IRCX_LIBERA_CHANNEL", "#Tulips")
+        monkeypatch.setenv("IRCX_LIBERA_SASL_USERNAME", "pascal/Libera")
+        from gateway.config import PlatformConfig
+        primary = ircx.load_config(PlatformConfig(), env_prefix="IRCX")
+        libera = ircx.load_config(PlatformConfig(), env_prefix="IRCX_LIBERA")
+        assert primary.nickname == "pascal" and primary.server == "rizon.example"
+        assert [c.name for c in primary.channels] == ["#a"]
+        # secondary reads ONLY its own namespace
+        assert libera.nickname == "Tulapascal" and libera.server == "127.0.0.1"
+        assert libera.sasl_username == "pascal/Libera"
+        assert [c.name for c in libera.channels] == ["#Tulips"]
+
+    def test_secondary_ignores_legacy_irc_fallback(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRC_SERVER", "legacy.example")  # primary-only drop-in compat
+        from gateway.config import PlatformConfig
+        primary = ircx.load_config(PlatformConfig(), env_prefix="IRCX")
+        libera = ircx.load_config(PlatformConfig(), env_prefix="IRCX_LIBERA")
+        assert primary.server == "legacy.example"  # primary honors IRC_* fallback
+        assert libera.server == ""                  # secondary does NOT
+
+    def test_adapter_honours_env_prefix(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_LIBERA_SERVER", "127.0.0.1")
+        monkeypatch.setenv("IRCX_LIBERA_NICKNAME", "Tulapascal")
+        monkeypatch.setenv("IRCX_LIBERA_CHANNEL", "#Tulips")
+        from gateway.config import PlatformConfig
+        # platform_name "ircx" (a valid Platform) keeps this unit-test self-contained;
+        # the env_prefix is what selects the Libera config.
+        a = IRCXAdapter(PlatformConfig(extra={}), env_prefix="IRCX_LIBERA", platform_name="ircx")
+        assert a._env_prefix == "IRCX_LIBERA"
+        assert a.cfg.nickname == "Tulapascal" and a.cfg.server == "127.0.0.1"
+
+    def test_register_extra_network_from_IRCX_NETWORKS(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_NETWORKS", "libera")
+        names = []
+        class Ctx:
+            def register_platform(self, **kw): names.append(kw["name"])
+            def register_tool(self, **kw): pass
+        ircx.register(Ctx())
+        assert "ircx" in names and "ircx-libera" in names
+
+    def test_no_extra_networks_by_default(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        names = []
+        class Ctx:
+            def register_platform(self, **kw): names.append(kw["name"])
+            def register_tool(self, **kw): pass
+        ircx.register(Ctx())
+        assert "ircx" in names and not any(n.startswith("ircx-") for n in names)
+
+    def test_check_requirements_prefix(self, monkeypatch):
+        _clear_irc_env(monkeypatch)
+        monkeypatch.setenv("IRCX_LIBERA_SERVER", "s")
+        monkeypatch.setenv("IRCX_LIBERA_CHANNEL", "#c")
+        assert ircx.check_requirements(env_prefix="IRCX_LIBERA") is True
+        assert ircx.check_requirements(env_prefix="IRCX") is False  # primary env unset

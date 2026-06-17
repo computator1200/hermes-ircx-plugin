@@ -123,6 +123,42 @@ gateway:
 | `dangerouslyAllowNameMatching` | `dangerously_allow_name_matching` |
 | `nickserv.*` | `nickserv.*` / `IRCX_NICKSERV_*` (or prefer SASL) |
 
+## Multiple networks (one gateway, shared memory)
+
+Run several IRC networks from a **single gateway** so they share the agent's
+memory, context, and identity. Set `IRCX_NETWORKS` to a comma-separated list of
+extra network names; each `<N>` registers a platform `ircx-<n>` configured from
+its own `IRCX_<N>_*` env namespace. The primary network keeps the unprefixed
+`IRCX_*` vars (and its legacy `IRC_*` fallbacks); extra networks are isolated to
+their own namespace.
+
+```bash
+# Primary network (Rizon, say) — unprefixed:
+IRCX_SERVER=irc.rizon.net
+IRCX_NICKNAME=pascal
+IRCX_CHANNEL=#home
+
+# Add a second network in the same gateway:
+IRCX_NETWORKS=libera
+IRCX_LIBERA_SERVER=irc.libera.chat
+IRCX_LIBERA_NICKNAME=PascalAI
+IRCX_LIBERA_CHANNEL=#mychan
+IRCX_LIBERA_SASL_MECHANISM=PLAIN
+IRCX_LIBERA_SASL_USERNAME=PascalAI
+IRCX_LIBERA_SASL_PASSWORD=...
+```
+
+Every `IRCX_*` setting has an `IRCX_<N>_*` counterpart (server, port, TLS, SASL,
+nick, channels, observe-mode, allowlists, `IRCX_<N>_BLOCKED_CHANNELS`, logging,
+etc.). All instances run in one process under one profile, so **byterover/native
+memory, sessions, and the agent persona are shared**. The agent replies on
+whichever network it was addressed in, and the `irc_*` tools are **network-aware**
+— they act on the network of the current turn (falling back to the primary).
+
+> Pairs naturally with a **bouncer**: point each `IRCX_<N>_SERVER` at your soju
+> instance with `IRCX_<N>_SASL_USERNAME=<user>/<network>` and soju multiplexes the
+> upstreams while each instance stays a clean single-network connection.
+
 ## Security notes
 
 - **Identity is the verified account, not the nick.** With the default

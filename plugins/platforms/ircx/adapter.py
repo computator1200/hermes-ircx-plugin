@@ -288,19 +288,39 @@ def _coerce_str_list(raw: Any) -> List[str]:
     return []
 
 
-def load_config(platform_config: Any) -> IRCXConfig:
+def _pfx_env(env_prefix: str, suffixes, *legacy):
+    """Read env with an instance prefix (``<prefix>_<suffix>``). Legacy ``IRC_*``
+    fallback keys apply only to the default ``IRCX`` (primary) prefix, so extra
+    network instances stay isolated from the primary's env."""
+    if isinstance(suffixes, str):
+        suffixes = (suffixes,)
+    keys = [f"{env_prefix}_{s}" for s in suffixes]
+    if env_prefix == "IRCX":
+        keys += list(legacy)
+    return _env(*keys)
+
+
+def load_config(platform_config: Any, env_prefix: str = "IRCX") -> IRCXConfig:
     """Build an :class:`IRCXConfig` from a ``PlatformConfig`` + environment.
 
-    Precedence: environment (``IRCX_*`` then legacy ``IRC_*``) overrides
-    ``config.yaml`` ``extra`` keys.
+    Precedence: environment (``<env_prefix>_*`` then, for the default ``IRCX``
+    prefix only, legacy ``IRC_*``) overrides ``config.yaml`` ``extra`` keys.
+
+    ``env_prefix`` lets additional network instances read an isolated env
+    namespace (e.g. ``IRCX_LIBERA_*``) so a single gateway can run several
+    IRC networks with shared agent memory.  The default ``IRCX`` prefix keeps
+    the primary instance byte-identical, including ``IRC_*`` drop-in fallbacks.
     """
     extra: Dict[str, Any] = getattr(platform_config, "extra", {}) or {}
     cfg = IRCXConfig()
 
-    cfg.server = _env("IRCX_SERVER", "IRC_SERVER") or str(extra.get("server", extra.get("host", "")))
+    def E(suffixes, *legacy):
+        return _pfx_env(env_prefix, suffixes, *legacy)
 
-    port_raw = _env("IRCX_PORT", "IRC_PORT") or extra.get("port")
-    use_tls_env = _env("IRCX_USE_TLS", "IRC_USE_TLS", "IRC_TLS")
+    cfg.server = E("SERVER", "IRC_SERVER") or str(extra.get("server", extra.get("host", "")))
+
+    port_raw = E("PORT", "IRC_PORT") or extra.get("port")
+    use_tls_env = E("USE_TLS", "IRC_USE_TLS", "IRC_TLS")
     if use_tls_env is not None:
         cfg.use_tls = _truthy(use_tls_env)
     else:
@@ -310,35 +330,35 @@ def load_config(platform_config: Any) -> IRCXConfig:
     except (TypeError, ValueError):
         cfg.port = 6697 if cfg.use_tls else 6667
 
-    tls_verify_env = _env("IRCX_TLS_VERIFY")
+    tls_verify_env = E("TLS_VERIFY")
     cfg.tls_verify = _truthy(tls_verify_env) if tls_verify_env is not None else bool(extra.get("tls_verify", True))
-    cfg.tls_client_cert = _env("IRCX_TLS_CLIENT_CERT") or extra.get("tls_client_cert")
-    cfg.tls_client_key = _env("IRCX_TLS_CLIENT_KEY") or extra.get("tls_client_key")
+    cfg.tls_client_cert = E("TLS_CLIENT_CERT") or extra.get("tls_client_cert")
+    cfg.tls_client_key = E("TLS_CLIENT_KEY") or extra.get("tls_client_key")
 
-    cfg.nickname = _env("IRCX_NICKNAME", "IRC_NICKNAME") or str(extra.get("nickname", "hermes-bot"))
-    cfg.username = _env("IRCX_USERNAME", "IRC_USERNAME") or str(extra.get("username", "")) or cfg.nickname
-    cfg.realname = _env("IRCX_REALNAME", "IRC_REALNAME") or str(extra.get("realname", "Hermes Agent"))
-    cfg.server_password = _env(
-        "IRCX_SERVER_PASSWORD", "IRC_SERVER_PASSWORD", "IRC_PASSWORD"
+    cfg.nickname = E("NICKNAME", "IRC_NICKNAME") or str(extra.get("nickname", "hermes-bot"))
+    cfg.username = E("USERNAME", "IRC_USERNAME") or str(extra.get("username", "")) or cfg.nickname
+    cfg.realname = E("REALNAME", "IRC_REALNAME") or str(extra.get("realname", "Hermes Agent"))
+    cfg.server_password = E(
+        "SERVER_PASSWORD", "IRC_SERVER_PASSWORD", "IRC_PASSWORD"
     ) or extra.get("server_password")
 
     # SASL (env or extra["sasl"] dict)
     sasl_extra = extra.get("sasl") if isinstance(extra.get("sasl"), dict) else {}
-    cfg.sasl_mechanism = _env("IRCX_SASL_MECHANISM") or sasl_extra.get("mechanism")
+    cfg.sasl_mechanism = E("SASL_MECHANISM") or sasl_extra.get("mechanism")
     if cfg.sasl_mechanism:
         cfg.sasl_mechanism = cfg.sasl_mechanism.strip().upper()
-    cfg.sasl_username = _env("IRCX_SASL_USERNAME") or sasl_extra.get("username") or cfg.nickname
-    cfg.sasl_password = _env("IRCX_SASL_PASSWORD") or sasl_extra.get("password")
+    cfg.sasl_username = E("SASL_USERNAME") or sasl_extra.get("username") or cfg.nickname
+    cfg.sasl_password = E("SASL_PASSWORD") or sasl_extra.get("password")
 
     # NickServ (env or extra["nickserv"] dict)
     ns_extra = extra.get("nickserv") if isinstance(extra.get("nickserv"), dict) else {}
-    cfg.nickserv_password = _env(
-        "IRCX_NICKSERV_PASSWORD", "IRC_NICKSERV_PASSWORD"
+    cfg.nickserv_password = E(
+        "NICKSERV_PASSWORD", "IRC_NICKSERV_PASSWORD"
     ) or ns_extra.get("password")
-    cfg.nickserv_service = _env("IRCX_NICKSERV_SERVICE") or ns_extra.get("service", "NickServ")
+    cfg.nickserv_service = E("NICKSERV_SERVICE") or ns_extra.get("service", "NickServ")
 
     # Channels
-    chans = _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+    chans = E(("CHANNEL", "CHANNELS"), "IRC_CHANNEL", "IRC_CHANNELS")
     if chans is not None:
         cfg.channels = _parse_channels(chans)
     else:
@@ -367,24 +387,24 @@ def load_config(platform_config: Any) -> IRCXConfig:
                     str(k): _coerce_str_list(v) for k, v in rule["tools_by_sender"].items()
                 }
 
-    rm_env = _env("IRCX_REQUIRE_MENTION", "IRC_REQUIRE_MENTION")
+    rm_env = E("REQUIRE_MENTION", "IRC_REQUIRE_MENTION")
     cfg.require_mention = _truthy(rm_env) if rm_env is not None else bool(extra.get("require_mention", True))
 
-    cfg.group_policy = (_env("IRCX_GROUP_POLICY") or str(extra.get("group_policy", "allowlist"))).strip().lower()
+    cfg.group_policy = (E("GROUP_POLICY") or str(extra.get("group_policy", "allowlist"))).strip().lower()
     if cfg.group_policy not in {"allowlist", "open"}:
         cfg.group_policy = "allowlist"
 
-    dnm_env = _env("IRCX_DANGEROUSLY_ALLOW_NAME_MATCHING")
+    dnm_env = E("DANGEROUSLY_ALLOW_NAME_MATCHING")
     cfg.dangerously_allow_name_matching = (
         _truthy(dnm_env) if dnm_env is not None
         else bool(extra.get("dangerously_allow_name_matching", False))
     )
 
-    cfg.allow_from = _coerce_str_list(_env("IRCX_ALLOW_FROM") or extra.get("allow_from"))
-    cfg.group_allow_from = _coerce_str_list(_env("IRCX_GROUP_ALLOW_FROM") or extra.get("group_allow_from"))
+    cfg.allow_from = _coerce_str_list(E("ALLOW_FROM") or extra.get("allow_from"))
+    cfg.group_allow_from = _coerce_str_list(E("GROUP_ALLOW_FROM") or extra.get("group_allow_from"))
     cfg.mention_aliases = _coerce_str_list(extra.get("mention_aliases"))
 
-    mml = _env("IRCX_MAX_MESSAGE_LENGTH") or extra.get("max_message_length")
+    mml = E("MAX_MESSAGE_LENGTH") or extra.get("max_message_length")
     try:
         cfg.max_message_length = int(mml) if mml is not None else 450
     except (TypeError, ValueError):
@@ -401,46 +421,46 @@ def load_config(platform_config: Any) -> IRCXConfig:
         cfg.rate_per_second = 2.0
 
     cfg.convert_formatting = bool(extra.get("convert_formatting", False))
-    cfg.home_channel = _env("IRCX_HOME_CHANNEL", "IRC_HOME_CHANNEL") or extra.get("home_channel")
+    cfg.home_channel = E("HOME_CHANNEL", "IRC_HOME_CHANNEL") or extra.get("home_channel")
     if not cfg.home_channel and cfg.channels:
         cfg.home_channel = cfg.channels[0].name
 
     # --- Feature A: observe / spontaneous ---
-    obs_env = _env("IRCX_OBSERVE_MODE")
+    obs_env = E("OBSERVE_MODE")
     cfg.observe_mode = _truthy(obs_env) if obs_env is not None else bool(extra.get("observe_mode", False))
-    prob = _env("IRCX_SPONTANEOUS_PROBABILITY") or extra.get("spontaneous_probability")
+    prob = E("SPONTANEOUS_PROBABILITY") or extra.get("spontaneous_probability")
     try:
         cfg.spontaneous_probability = max(0.0, min(1.0, float(prob))) if prob is not None else 0.0
     except (TypeError, ValueError):
         cfg.spontaneous_probability = 0.0
-    cd = _env("IRCX_SPONTANEOUS_COOLDOWN") or extra.get("spontaneous_cooldown")
+    cd = E("SPONTANEOUS_COOLDOWN") or extra.get("spontaneous_cooldown")
     try:
         cfg.spontaneous_cooldown = float(cd) if cd is not None else 90.0
     except (TypeError, ValueError):
         cfg.spontaneous_cooldown = 90.0
-    cbs = _env("IRCX_CONTEXT_BUFFER") or extra.get("context_buffer_size")
+    cbs = E("CONTEXT_BUFFER") or extra.get("context_buffer_size")
     try:
         cfg.context_buffer_size = max(0, int(cbs)) if cbs is not None else 15
     except (TypeError, ValueError):
         cfg.context_buffer_size = 15
-    ev_env = _env("IRCX_SHOW_EVENTS")
+    ev_env = E("SHOW_EVENTS")
     cfg.show_events = _truthy(ev_env) if ev_env is not None else bool(extra.get("show_events", False))
 
     # --- Feature B: runtime agency ---
-    aj_env = _env("IRCX_ALLOW_AGENT_JOIN")
+    aj_env = E("ALLOW_AGENT_JOIN")
     cfg.allow_agent_join = _truthy(aj_env) if aj_env is not None else bool(extra.get("allow_agent_join", False))
-    cfg.joinable_channels = _coerce_str_list(_env("IRCX_JOINABLE_CHANNELS") or extra.get("joinable_channels"))
-    cfg.blocked_channels = _coerce_str_list(_env("IRCX_BLOCKED_CHANNELS") or extra.get("blocked_channels"))
+    cfg.joinable_channels = _coerce_str_list(E("JOINABLE_CHANNELS") or extra.get("joinable_channels"))
+    cfg.blocked_channels = _coerce_str_list(E("BLOCKED_CHANNELS") or extra.get("blocked_channels"))
     # A blocked channel is never auto-joined, even if listed in IRCX_CHANNEL.
     if cfg.blocked_channels:
         _blk = {c.lower() for c in cfg.blocked_channels}
         cfg.channels = [c for c in cfg.channels if c.name.lower() not in _blk]
-    ak_env = _env("IRCX_ALLOW_AGENT_KICK")
+    ak_env = E("ALLOW_AGENT_KICK")
     cfg.allow_agent_kick = _truthy(ak_env) if ak_env is not None else bool(extra.get("allow_agent_kick", False))
 
     # --- Feature C: persistence ---
-    cfg.log_dir = _env("IRCX_LOG_DIR") or extra.get("log_dir")
-    chl = _env("IRCX_CHATHISTORY_LIMIT") or extra.get("chathistory_limit")
+    cfg.log_dir = E("LOG_DIR") or extra.get("log_dir")
+    chl = E("CHATHISTORY_LIMIT") or extra.get("chathistory_limit")
     try:
         cfg.chathistory_limit = max(1, int(chl)) if chl is not None else 50
     except (TypeError, ValueError):
@@ -1637,9 +1657,12 @@ class IRCClient:
 class IRCXAdapter(BasePlatformAdapter):
     """IRCv3 adapter implementing the BasePlatformAdapter contract."""
 
-    def __init__(self, config: Any, **kwargs: Any):
-        super().__init__(config=config, platform=Platform("ircx"))
-        self.cfg = load_config(config)
+    def __init__(self, config: Any, *, env_prefix: str = "IRCX",
+                 platform_name: str = "ircx", **kwargs: Any):
+        super().__init__(config=config, platform=Platform(platform_name))
+        self._env_prefix = env_prefix
+        self._platform_name = platform_name
+        self.cfg = load_config(config, env_prefix=env_prefix)
         self._client: Optional[IRCClient] = None
         self._lock_key: Optional[str] = None
         # Rolling per-channel context buffers (deques of "nick: text").
@@ -1853,7 +1876,7 @@ class IRCXAdapter(BasePlatformAdapter):
 
     def _is_authorized(self, identity: Optional[str], is_channel: bool, target: str) -> bool:
         # allow-all (env or extra) short-circuit
-        if _truthy(_env("IRCX_ALLOW_ALL_USERS", "IRC_ALLOW_ALL_USERS") or ""):
+        if _truthy(_pfx_env(self._env_prefix, "ALLOW_ALL_USERS", "IRC_ALLOW_ALL_USERS") or ""):
             return True
         if identity is None:
             return False
@@ -1872,7 +1895,7 @@ class IRCXAdapter(BasePlatformAdapter):
             if self.cfg.allow_from:
                 return ident_l in {a.lower() for a in self.cfg.allow_from}
 
-        env_list = _coerce_str_list(_env("IRCX_ALLOWED_USERS", "IRC_ALLOWED_USERS"))
+        env_list = _coerce_str_list(_pfx_env(self._env_prefix, "ALLOWED_USERS", "IRC_ALLOWED_USERS"))
         if env_list:
             return ident_l in {a.lower() for a in env_list}
         # No adapter-side allowlist configured — defer to the gateway's
@@ -2272,7 +2295,7 @@ class IRCXAdapter(BasePlatformAdapter):
         """Which allowed users (by verified account or nick) are visible right now."""
         if not self._client or not self.is_connected:
             return {"error": "not connected"}
-        allowed = _coerce_str_list(_env("IRCX_ALLOWED_USERS", "IRC_ALLOWED_USERS")) or list(self.cfg.allow_from)
+        allowed = _coerce_str_list(_pfx_env(self._env_prefix, "ALLOWED_USERS", "IRC_ALLOWED_USERS")) or list(self.cfg.allow_from)
         if not allowed:
             return {"success": True, "online": [], "note": "no allowed_users configured"}
         allowed_l = {a.lower() for a in allowed}
@@ -2438,12 +2461,30 @@ class IRCXAdapter(BasePlatformAdapter):
 # ===========================================================================
 
 def _live_ircx_adapter() -> Optional["IRCXAdapter"]:
-    """Fetch the running IRCXAdapter from the in-process gateway, if any."""
+    """Fetch the running IRCXAdapter from the in-process gateway, if any.
+
+    Network-aware: when several ircx instances run in one gateway (multi-network),
+    resolve the adapter for the platform of the *current turn* — so a tool acts on
+    whichever network the agent was addressed in. Falls back to the primary ``ircx``.
+    """
     try:
         from gateway.run import _gateway_runner_ref
         runner = _gateway_runner_ref()
         if runner is None:
             return None
+        # Platform of the current turn (set per-message; propagated to tool threads).
+        try:
+            from gateway.session_context import get_session_env
+            plat = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+        except Exception:
+            plat = ""
+        if plat.startswith("ircx") and plat != "ircx":
+            try:
+                ad = runner.adapters.get(Platform(plat))
+            except Exception:
+                ad = None
+            if ad is not None:
+                return ad
         return runner.adapters.get(Platform("ircx"))
     except Exception:
         return None
@@ -2984,52 +3025,52 @@ _IRCX_TOOL_SCHEMAS = {
     },
 }
 
-def check_requirements() -> bool:
+def check_requirements(env_prefix: str = "IRCX") -> bool:
     """Dependencies present and minimally configured?"""
     if not _LIBS_OK:
         return False
-    server = _env("IRCX_SERVER", "IRC_SERVER")
-    channel = _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+    server = _pfx_env(env_prefix, "SERVER", "IRC_SERVER")
+    channel = _pfx_env(env_prefix, ("CHANNEL", "CHANNELS"), "IRC_CHANNEL", "IRC_CHANNELS")
     return bool(server and channel)
 
 
-def validate_config(config: Any) -> bool:
+def validate_config(config: Any, env_prefix: str = "IRCX") -> bool:
     if not _LIBS_OK:
         return False
-    cfg = load_config(config)
+    cfg = load_config(config, env_prefix=env_prefix)
     return bool(cfg.server and cfg.channels)
 
 
-def is_connected(config: Any) -> bool:
+def is_connected(config: Any, env_prefix: str = "IRCX") -> bool:
     extra = getattr(config, "extra", {}) or {}
-    server = _env("IRCX_SERVER", "IRC_SERVER") or extra.get("server")
+    server = _pfx_env(env_prefix, "SERVER", "IRC_SERVER") or extra.get("server")
     channel = (
-        _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+        _pfx_env(env_prefix, ("CHANNEL", "CHANNELS"), "IRC_CHANNEL", "IRC_CHANNELS")
         or extra.get("channels") or extra.get("channel")
     )
     return bool(server and channel)
 
 
-def _env_enablement() -> Optional[dict]:
+def _env_enablement(env_prefix: str = "IRCX") -> Optional[dict]:
     """Seed PlatformConfig.extra from env vars before adapter construction."""
-    server = _env("IRCX_SERVER", "IRC_SERVER")
-    channel = _env("IRCX_CHANNEL", "IRCX_CHANNELS", "IRC_CHANNEL", "IRC_CHANNELS")
+    server = _pfx_env(env_prefix, "SERVER", "IRC_SERVER")
+    channel = _pfx_env(env_prefix, ("CHANNEL", "CHANNELS"), "IRC_CHANNEL", "IRC_CHANNELS")
     if not (server and channel):
         return None
     seed: dict = {"server": server, "channel": channel}
-    port = _env("IRCX_PORT", "IRC_PORT")
+    port = _pfx_env(env_prefix, "PORT", "IRC_PORT")
     if port:
         try:
             seed["port"] = int(port)
         except ValueError:
             pass
-    nickname = _env("IRCX_NICKNAME", "IRC_NICKNAME")
+    nickname = _pfx_env(env_prefix, "NICKNAME", "IRC_NICKNAME")
     if nickname:
         seed["nickname"] = nickname
-    use_tls = _env("IRCX_USE_TLS", "IRC_USE_TLS", "IRC_TLS")
+    use_tls = _pfx_env(env_prefix, "USE_TLS", "IRC_USE_TLS", "IRC_TLS")
     if use_tls is not None:
         seed["use_tls"] = _truthy(use_tls)
-    home = _env("IRCX_HOME_CHANNEL", "IRC_HOME_CHANNEL") or channel.split(",")[0].strip()
+    home = _pfx_env(env_prefix, "HOME_CHANNEL", "IRC_HOME_CHANNEL") or channel.split(",")[0].strip()
     if home:
         seed["home_channel"] = {"chat_id": home, "name": home}
     return seed
@@ -3043,6 +3084,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    env_prefix: str = "IRCX",
 ) -> Dict[str, Any]:
     """Out-of-process delivery for cron jobs (no live gateway adapter).
 
@@ -3051,7 +3093,7 @@ async def _standalone_send(
     """
     if not _LIBS_OK:
         return {"error": f"IRCX standalone send: {INSTALL_HINT}"}
-    cfg = load_config(pconfig)
+    cfg = load_config(pconfig, env_prefix=env_prefix)
     if not cfg.server:
         return {"error": "IRCX standalone send: server not configured"}
     target = chat_id or (cfg.home_channel or "")
@@ -3171,45 +3213,70 @@ def interactive_setup() -> None:
     print_info("Restart the gateway: hermes gateway restart")
 
 
-def register(ctx: Any) -> None:
-    """Plugin entry point — called by the Hermes plugin system."""
+_PLATFORM_HINT = (
+    "You are chatting via IRC. IRC does not support markdown rendering "
+    "— use plain text. Long messages are automatically split into "
+    "~450-character lines. In channels users address you by prefixing "
+    "your nick. Keep responses concise and conversational. You have "
+    "irc_join / irc_part / irc_say / irc_list_channels tools to manage "
+    "channels when permitted (only join channels when explicitly asked), "
+    "and irc_channel_info / irc_whois to see who is in a channel, the "
+    "user/op counts, the topic, and details about a specific user. "
+    "You can also irc_away to flag stepping back, irc_whois_server to "
+    "check if a nick is online network-wide, irc_cycle to reset a "
+    "desynced channel, irc_set_key to manage a channel password, and "
+    "irc_ignore to briefly mute someone (it lapses on its own). To talk "
+    "to IRC services or bots (NickServ, ChanServ, MemoServ, etc.) use "
+    "irc_query — it sends them a message and returns their reply "
+    "(including NOTICE replies, which you otherwise can't see). If you are "
+    "connected to multiple IRC networks, each is a separate platform; reply "
+    "on whichever network you were addressed in."
+)
+
+
+def _register_network(ctx: Any, platform_name: str, env_prefix: str, label: str) -> None:
+    """Register one ircx platform instance — the primary (``ircx`` / ``IRCX_*``)
+    or an extra network (``ircx-<net>`` / ``IRCX_<NET>_*``). Extra networks run
+    in the same gateway/profile, so they share the agent's memory and context;
+    the default ``IRCX`` prefix keeps the primary instance byte-identical."""
+    import functools
+    _primary = (env_prefix == "IRCX")
+    bind = (lambda f: f) if _primary else (lambda f: functools.partial(f, env_prefix=env_prefix))
     ctx.register_platform(
-        name="ircx",
-        label="IRC",
-        adapter_factory=lambda cfg: IRCXAdapter(cfg),
-        check_fn=check_requirements,
-        validate_config=validate_config,
-        is_connected=is_connected,
-        required_env=["IRCX_SERVER", "IRCX_CHANNEL", "IRCX_NICKNAME"],
+        name=platform_name,
+        label=label,
+        adapter_factory=(lambda cfg, p=env_prefix, n=platform_name:
+                         IRCXAdapter(cfg, env_prefix=p, platform_name=n)),
+        check_fn=bind(check_requirements),
+        validate_config=bind(validate_config),
+        is_connected=bind(is_connected),
+        required_env=[f"{env_prefix}_SERVER", f"{env_prefix}_CHANNEL", f"{env_prefix}_NICKNAME"],
         install_hint=INSTALL_HINT,
-        setup_fn=interactive_setup,
-        env_enablement_fn=_env_enablement,
-        cron_deliver_env_var="IRCX_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send,
-        allowed_users_env="IRCX_ALLOWED_USERS",
-        allow_all_env="IRCX_ALLOW_ALL_USERS",
+        setup_fn=(interactive_setup if _primary else None),
+        env_enablement_fn=bind(_env_enablement),
+        cron_deliver_env_var=f"{env_prefix}_HOME_CHANNEL",
+        standalone_sender_fn=bind(_standalone_send),
+        allowed_users_env=f"{env_prefix}_ALLOWED_USERS",
+        allow_all_env=f"{env_prefix}_ALLOW_ALL_USERS",
         max_message_length=450,
         emoji="💬",
         pii_safe=False,
         allow_update_command=True,
-        platform_hint=(
-            "You are chatting via IRC. IRC does not support markdown rendering "
-            "— use plain text. Long messages are automatically split into "
-            "~450-character lines. In channels users address you by prefixing "
-            "your nick. Keep responses concise and conversational. You have "
-            "irc_join / irc_part / irc_say / irc_list_channels tools to manage "
-            "channels when permitted (only join channels when explicitly asked), "
-            "and irc_channel_info / irc_whois to see who is in a channel, the "
-            "user/op counts, the topic, and details about a specific user. "
-            "You can also irc_away to flag stepping back, irc_whois_server to "
-            "check if a nick is online network-wide, irc_cycle to reset a "
-            "desynced channel, irc_set_key to manage a channel password, and "
-            "irc_ignore to briefly mute someone (it lapses on its own). To talk "
-            "to IRC services or bots (NickServ, ChanServ, MemoServ, etc.) use "
-            "irc_query — it sends them a message and returns their reply "
-            "(including NOTICE replies, which you otherwise can't see)."
-        ),
+        platform_hint=_PLATFORM_HINT,
     )
+
+
+def register(ctx: Any) -> None:
+    """Plugin entry point — called by the Hermes plugin system."""
+    _register_network(ctx, "ircx", "IRCX", "IRC")
+
+    # Additional IRC networks in the SAME gateway (shared agent memory):
+    #   IRCX_NETWORKS=libera  ->  platform "ircx-libera", config from IRCX_LIBERA_*
+    for _suffix in _coerce_str_list(_env("IRCX_NETWORKS")):
+        _s = _suffix.strip()
+        if not _s or _s.lower() == "ircx":
+            continue
+        _register_network(ctx, f"ircx-{_s.lower()}", f"IRCX_{_s.upper()}", f"IRC ({_s})")
 
     # Runtime agency tools (Feature B).  Registered under the ``ircx`` toolset;
     # enable it for the platform (platform_toolsets.ircx) to expose them.
