@@ -1,6 +1,6 @@
-<!-- Banner -->
+<!-- Logo -->
 <p align="center">
-  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=12,20,30&height=210&section=header&text=IRCX&fontSize=82&fontColor=ffffff&desc=A%20full%20IRCv3%20adapter%20for%20Hermes%20Agent&descAlignY=72&descSize=20" alt="IRCX banner" />
+  <img src="assets/logo.png" alt="hermes-ircx-plugin" width="240">
 </p>
 
 <!-- Badges / stickers -->
@@ -28,15 +28,6 @@
   <b>Connect your <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a> to IRC</b> - channels and DMs - with a full, modern IRCv3 stack.<br>
   <sub>A feature superset of the stdlib <code>irc</code> example Hermes ships with, and then some. 💬</sub>
 </p>
-
-## 🎬 In action
-
-<p align="center">
-  <img src="assets/demo.svg" alt="IRCX live on Rizon: replying when addressed, then using its tools to join a channel and report status" width="780">
-</p>
-<p align="center"><sub>A real session on Rizon (bridged to Matrix) - answering when addressed, then autonomously using <code>irc_join</code> → <code>irc_say</code> → <code>irc_list_channels</code>. Model: Xiaomi MiMo v2.5-pro.</sub></p>
-
----
 
 > 📖 **Deep-dive docs:** [Configuration](docs/Configuration.md) · [Interactive Behaviours](docs/Interactive-Behaviours.md) · [Authentication & SASL](docs/Authentication-and-SASL.md) · [Troubleshooting](docs/Troubleshooting.md) - see [`docs/`](docs/) (also mirrored to the [Wiki](https://github.com/computator1200/hermes-ircx-plugin/wiki)).
 
@@ -142,6 +133,35 @@ IRCX_CHATHISTORY_LIMIT=50              # IRCv3 draft/chathistory backfill size
 
 See [`plugins/platforms/ircx/plugin.yaml`](plugins/platforms/ircx/plugin.yaml) for **every** option, and the [plugin README](plugins/platforms/ircx/README.md) for the full behaviour reference.
 </details>
+
+---
+
+## 💬 Chat commands
+
+Drive the bot from a PM or in-channel (authorised users only). Two prefixes:
+
+**`.agent <command>`** - agent/gateway controls, bridged to Hermes' slash commands:
+
+```text
+.agent model <name>      .agent reasoning high
+.agent reset             .agent whoami
+.agent help              .agent status
+```
+
+**`.ircx <command>`** - live configuration of *this* IRC adapter, persisted to `ircx.env`:
+
+```text
+.ircx list                       # every non-secret setting + current value
+.ircx get observe_mode
+.ircx set observe_mode true      # hot keys apply instantly
+.ircx set blocked_channels #foo,#bar
+.ircx set port 6697              # connection keys: saved, then...
+.ircx restart                    # ...apply with a restart
+```
+
+Hot keys apply live; connection keys (server, port, nickname, channel, networks, `sasl_*`...) need `.ircx restart`. Secrets (passwords) stay in `.env`, show as `***`, and can't be set from chat. Both prefixes are configurable (`IRCX_COMMAND_PREFIX` / `IRCX_ADMIN_PREFIX`).
+
+> Point `IRCX_CONFIG_FILE` at a dedicated `ircx.env` to keep the adapter's many options out of your main `.env`; `.ircx set` writes there.
 
 ---
 
