@@ -8,16 +8,16 @@ Every `IRCX_*` variable falls back to its `IRC_*` equivalent, so configs written
 
 | Env | config.yaml `extra` | Default | Notes |
 |---|---|---|---|
-| `IRCX_SERVER` | `server` / `host` | — | **required** |
+| `IRCX_SERVER` | `server` / `host` | - | **required** |
 | `IRCX_PORT` | `port` | 6697 (TLS) / 6667 | |
 | `IRCX_USE_TLS` | `use_tls` / `tls` | `true` | |
 | `IRCX_TLS_VERIFY` | `tls_verify` | `true` | set `false` only for self-signed test servers |
-| `IRCX_TLS_CLIENT_CERT` | `tls_client_cert` | — | PEM, for SASL `EXTERNAL` / CertFP |
+| `IRCX_TLS_CLIENT_CERT` | `tls_client_cert` | - | PEM, for SASL `EXTERNAL` / CertFP |
 | `IRCX_TLS_CLIENT_KEY` | `tls_client_key` | = cert | |
 | `IRCX_NICKNAME` | `nickname` | `hermes-bot` | |
 | `IRCX_USERNAME` | `username` | = nick | ident |
 | `IRCX_REALNAME` | `realname` | `Hermes Agent` | |
-| `IRCX_SERVER_PASSWORD` | `server_password` | — | `PASS` command |
+| `IRCX_SERVER_PASSWORD` | `server_password` | - | `PASS` command |
 
 ## Channels
 
@@ -74,8 +74,8 @@ See **[Authentication and SASL](Authentication-and-SASL.md)** for the full model
 | `IRCX_SPONTANEOUS_COOLDOWN` | 90 | seconds between spontaneous posts/channel |
 | `IRCX_CONTEXT_BUFFER` | 15 | recent lines kept per channel for context |
 | `IRCX_ALLOW_AGENT_JOIN` | `false` | enable `irc_join`/`irc_part` tools |
-| `IRCX_JOINABLE_CHANNELS` | — | allowlist for agent joins (empty = any) |
-| `IRCX_LOG_DIR` | — | enable channel logging + tail replay |
+| `IRCX_JOINABLE_CHANNELS` | - | allowlist for agent joins (empty = any) |
+| `IRCX_LOG_DIR` | - | enable channel logging + tail replay |
 | `IRCX_CHATHISTORY_LIMIT` | 50 | `draft/chathistory` backfill size on (re)join |
 
 `config.yaml`-only extras: `mention_aliases` (extra names that count as addressing), `convert_formatting` (`true` → markdown becomes mIRC bold/italic codes instead of being stripped), `rate_limit: {burst, per_second}`.

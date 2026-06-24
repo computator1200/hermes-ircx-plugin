@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <b>Connect your <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a> to IRC</b> — channels and DMs — with a full, modern IRCv3 stack.<br>
+  <b>Connect your <a href="https://github.com/NousResearch/hermes-agent">Hermes Agent</a> to IRC</b> - channels and DMs - with a full, modern IRCv3 stack.<br>
   <sub>A feature superset of the stdlib <code>irc</code> example Hermes ships with, and then some. 💬</sub>
 </p>
 
@@ -34,19 +34,19 @@
 <p align="center">
   <img src="assets/demo.svg" alt="IRCX live on Rizon: replying when addressed, then using its tools to join a channel and report status" width="780">
 </p>
-<p align="center"><sub>A real session on Rizon (bridged to Matrix) — answering when addressed, then autonomously using <code>irc_join</code> → <code>irc_say</code> → <code>irc_list_channels</code>. Model: Xiaomi MiMo v2.5-pro.</sub></p>
+<p align="center"><sub>A real session on Rizon (bridged to Matrix) - answering when addressed, then autonomously using <code>irc_join</code> → <code>irc_say</code> → <code>irc_list_channels</code>. Model: Xiaomi MiMo v2.5-pro.</sub></p>
 
 ---
 
-> 📖 **Deep-dive docs:** [Configuration](docs/Configuration.md) · [Interactive Behaviours](docs/Interactive-Behaviours.md) · [Authentication & SASL](docs/Authentication-and-SASL.md) · [Troubleshooting](docs/Troubleshooting.md) — see [`docs/`](docs/) (also mirrored to the [Wiki](https://github.com/computator1200/hermes-ircx-plugin/wiki)).
+> 📖 **Deep-dive docs:** [Configuration](docs/Configuration.md) · [Interactive Behaviours](docs/Interactive-Behaviours.md) · [Authentication & SASL](docs/Authentication-and-SASL.md) · [Troubleshooting](docs/Troubleshooting.md) - see [`docs/`](docs/) (also mirrored to the [Wiki](https://github.com/computator1200/hermes-ircx-plugin/wiki)).
 
 ---
 
 ## 🛰️ Why IRCX?
 
-Hermes ships only a minimal stdlib `irc` **example**. **IRCX** is a more complete alternative — built on the spec-compliant [`irctokens`](https://pypi.org/project/irctokens/) + [`ircstates`](https://pypi.org/project/ircstates/) IRCv3 libraries — that turns your agent into a real channel citizen: it authenticates properly, remembers conversations across disconnects, can manage its own channels on request, and can even chime into the conversation on its own.
+Hermes ships only a minimal stdlib `irc` **example**. **IRCX** is a more complete alternative - built on the spec-compliant [`irctokens`](https://pypi.org/project/irctokens/) + [`ircstates`](https://pypi.org/project/ircstates/) IRCv3 libraries - that turns your agent into a real channel citizen: it authenticates properly, remembers conversations across disconnects, can manage its own channels on request, and can even chime into the conversation on its own.
 
-> **Platform name:** `ircx` — coexists with the bundled `irc` example, so you can run both side-by-side and switch when ready.
+> **Platform name:** `ircx` - coexists with the bundled `irc` example, so you can run both side-by-side and switch when ready.
 
 ---
 
@@ -54,13 +54,13 @@ Hermes ships only a minimal stdlib `irc` **example**. **IRCX** is a more complet
 
 | | Capability |
 |---|---|
-| 🤝 | **IRCv3 capability negotiation** — `CAP LS 302 → REQ → END`, only ACKed caps used |
-| 🔐 | **SASL** — `PLAIN`, `EXTERNAL` (CertFP), `SCRAM-SHA-256`, `SCRAM-SHA-512` (+ NickServ fallback) |
-| 🪪 | **Verified-account auth** — authorize by network account (`account-tag` / `extended-join`), *not* the spoofable nick. Bare-nick auth is opt-in |
-| 🏷️ | **Message tags** — `server-time`, `msgid`, `+draft/reply` threaded replies, `+typing` notifications |
-| 📡 | **Robust transport** — multi-channel, channel keys, flood protection, keepalive + ping-timeout, gateway-driven reconnect (rejoins + re-auths) |
-| 🧭 | **ISUPPORT-aware** — casemapping, `CHANTYPES`, byte-accurate message splitting; CTCP `VERSION`/`PING`/`TIME`/`ACTION` |
-| 🛡️ | **OpenClaw parity** — `group_policy`, per-channel `groups` (`require_mention` / `allow_from` / `tools` / `tools_by_sender`), DM allowlists |
+| 🤝 | **IRCv3 capability negotiation** - `CAP LS 302 → REQ → END`, only ACKed caps used |
+| 🔐 | **SASL** - `PLAIN`, `EXTERNAL` (CertFP), `SCRAM-SHA-256`, `SCRAM-SHA-512` (+ NickServ fallback) |
+| 🪪 | **Verified-account auth** - authorize by network account (`account-tag` / `extended-join`), *not* the spoofable nick. Bare-nick auth is opt-in |
+| 🏷️ | **Message tags** - `server-time`, `msgid`, `+draft/reply` threaded replies, `+typing` notifications |
+| 📡 | **Robust transport** - multi-channel, channel keys, flood protection, keepalive + ping-timeout, gateway-driven reconnect (rejoins + re-auths) |
+| 🧭 | **ISUPPORT-aware** - casemapping, `CHANTYPES`, byte-accurate message splitting; CTCP `VERSION`/`PING`/`TIME`/`ACTION` |
+| 🛡️ | **OpenClaw parity** - `group_policy`, per-channel `groups` (`require_mention` / `allow_from` / `tools` / `tools_by_sender`), DM allowlists |
 
 ### 🎭 Interactive agent behaviours
 
@@ -70,7 +70,7 @@ Hermes ships only a minimal stdlib `irc` **example**. **IRCX** is a more complet
 
 **👀 Observe mode**
 
-Keeps rolling channel context and may *spontaneously* contribute to the conversation — probability- and cooldown-gated. Declines gracefully with `<silent>`.
+Keeps rolling channel context and may *spontaneously* contribute to the conversation - probability- and cooldown-gated. Declines gracefully with `<silent>`.
 
 </td>
 <td width="33%" valign="top">
@@ -100,7 +100,7 @@ IRCv3 `draft/chathistory` backfill on (re)join, plus optional on-disk logging wi
 <hermes-venv>/bin/python -m pip install irctokens ircstates
 ```
 
-**2 · Drop in the plugin** — either works:
+**2 · Drop in the plugin** - either works:
 
 ```bash
 cp -r plugins/platforms/ircx ~/.hermes/plugins/ircx            # as a user plugin
@@ -126,7 +126,7 @@ Restart the gateway and you're live. Every `IRCX_*` var falls back to the legacy
 <summary><b>🎚️ Optional: enable the interactive behaviours</b></summary>
 
 ```bash
-# Observe mode — occasionally chime in on unaddressed chatter
+# Observe mode - occasionally chime in on unaddressed chatter
 IRCX_OBSERVE_MODE=true
 IRCX_SPONTANEOUS_PROBABILITY=0.15      # 0..1
 IRCX_SPONTANEOUS_COOLDOWN=90           # seconds between spontaneous posts/channel
@@ -147,13 +147,13 @@ See [`plugins/platforms/ircx/plugin.yaml`](plugins/platforms/ircx/plugin.yaml) f
 
 ## 🧩 Optional: per-channel tool scoping
 
-`groups.<chan>.tools` / `tools_by_sender` (toolset-level scoping) is enforced via a tiny, generic, backward-compatible core hook — documented in [`CORE_PATCH.md`](CORE_PATCH.md). Without the patch the plugin still works; the scope is simply ignored. It's a clean candidate to upstream into Hermes.
+`groups.<chan>.tools` / `tools_by_sender` (toolset-level scoping) is enforced via a tiny, generic, backward-compatible core hook - documented in [`CORE_PATCH.md`](CORE_PATCH.md). Without the patch the plugin still works; the scope is simply ignored. It's a clean candidate to upstream into Hermes.
 
 ---
 
 ## 🧪 Tests
 
-`tests/` run against the Hermes test harness — from inside a `hermes-agent` checkout with the plugin installed at `plugins/platforms/ircx/`:
+`tests/` run against the Hermes test harness - from inside a `hermes-agent` checkout with the plugin installed at `plugins/platforms/ircx/`:
 
 ```bash
 cp tests/test_ircx_*.py <hermes-agent>/tests/gateway/
@@ -178,4 +178,4 @@ cd <hermes-agent>
   &nbsp;·&nbsp; Built with the Hermes Agent platform-adapter SDK
   &nbsp;·&nbsp; <a href="https://github.com/computator1200/hermes-ircx-plugin/issues">Report a bug</a>
 </p>
-<p align="center"><sub>If IRCX is useful to you, consider leaving a ⭐ — it helps others find it.</sub></p>
+<p align="center"><sub>If IRCX is useful to you, consider leaving a ⭐ - it helps others find it.</sub></p>

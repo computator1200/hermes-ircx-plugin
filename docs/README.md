@@ -6,10 +6,10 @@ A full **IRCv3** platform adapter for [Hermes Agent](https://github.com/NousRese
 
 ## 📚 Pages
 
-- **[Configuration](Configuration.md)** — every `IRCX_*` env var, `config.yaml` schema, per-channel `groups`, precedence.
-- **[Interactive Behaviours](Interactive-Behaviours.md)** — observe-mode spontaneous replies, runtime channel-agency tools, downtime context persistence.
-- **[Authentication and SASL](Authentication-and-SASL.md)** — the verified-account identity model, SASL mechanisms, allowlists, hardening.
-- **[Troubleshooting](Troubleshooting.md)** — connect / join / reply / reconnect issues and fixes.
+- **[Configuration](Configuration.md)** - every `IRCX_*` env var, `config.yaml` schema, per-channel `groups`, precedence.
+- **[Interactive Behaviours](Interactive-Behaviours.md)** - observe-mode spontaneous replies, runtime channel-agency tools, downtime context persistence.
+- **[Authentication and SASL](Authentication-and-SASL.md)** - the verified-account identity model, SASL mechanisms, allowlists, hardening.
+- **[Troubleshooting](Troubleshooting.md)** - connect / join / reply / reconnect issues and fixes.
 
 ## 60-second start
 

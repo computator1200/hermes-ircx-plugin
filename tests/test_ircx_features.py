@@ -874,7 +874,7 @@ class TestMembershipEvents:
 
 
 # ---------------------------------------------------------------------------
-# Blocked-channels denylist (IRCX_BLOCKED_CHANNELS) — never join, even on request
+# Blocked-channels denylist (IRCX_BLOCKED_CHANNELS) - never join, even on request
 # ---------------------------------------------------------------------------
 
 class TestBlockedChannels:
@@ -922,7 +922,7 @@ class TestBlockedChannels:
 
 
 # ---------------------------------------------------------------------------
-# irc_query — drive services/bots and capture their (NOTICE) replies
+# irc_query - drive services/bots and capture their (NOTICE) replies
 # ---------------------------------------------------------------------------
 
 class TestServiceQuery:

@@ -1,14 +1,14 @@
-# IRCX — IRCv3 platform adapter for Hermes Agent
+# IRCX - IRCv3 platform adapter for Hermes Agent
 
 > **Advanced features** (see "Interactive agent behaviours" below): observe-mode
 > spontaneous contribution, runtime channel-agency tools (`irc_join` / `irc_part`
 > / `irc_say` / `irc_list_channels`), channel introspection (`irc_channel_info`
-> / `irc_whois` — roster, ops, topic, user lookup), and downtime context
+> / `irc_whois` - roster, ops, topic, user lookup), and downtime context
 > persistence (IRCv3 `draft/chathistory` backfill + on-disk logging tail replay).
 
 A drop-in gateway platform plugin that connects Hermes to IRC with full
 IRCv3 support. Built on the [`irctokens`](https://pypi.org/project/irctokens/)
-+ [`ircstates`](https://pypi.org/project/ircstates/) stack — the spec-compliant,
++ [`ircstates`](https://pypi.org/project/ircstates/) stack - the spec-compliant,
 sans-IO IRCv3 parsing/state libraries.
 
 It re-implements, and is a superset of, the bundled
@@ -65,7 +65,7 @@ IRCX_USE_TLS=true
 IRCX_SASL_MECHANISM=PLAIN
 IRCX_SASL_USERNAME=hermes
 IRCX_SASL_PASSWORD=...
-# Access control — verified accounts allowed to command the bot
+# Access control - verified accounts allowed to command the bot
 IRCX_ALLOWED_USERS=alice,bob
 ```
 
@@ -133,7 +133,7 @@ its own `IRCX_<N>_*` env namespace. The primary network keeps the unprefixed
 their own namespace.
 
 ```bash
-# Primary network (Rizon, say) — unprefixed:
+# Primary network (Rizon, say) - unprefixed:
 IRCX_SERVER=irc.rizon.net
 IRCX_NICKNAME=pascal
 IRCX_CHANNEL=#home
@@ -153,7 +153,7 @@ nick, channels, observe-mode, allowlists, `IRCX_<N>_BLOCKED_CHANNELS`, logging,
 etc.). All instances run in one process under one profile, so **byterover/native
 memory, sessions, and the agent persona are shared**. The agent replies on
 whichever network it was addressed in, and the `irc_*` tools are **network-aware**
-— they act on the network of the current turn (falling back to the primary).
+- they act on the network of the current turn (falling back to the primary).
 
 > Pairs naturally with a **bouncer**: point each `IRCX_<N>_SERVER` at your soju
 > instance with `IRCX_<N>_SASL_USERNAME=<user>/<network>` and soju multiplexes the
@@ -193,7 +193,7 @@ JOIN) has been verified end to end.
 Per-channel `tools` and per-sender `tools_by_sender` are **enforced** via a
 small generic core hook (`MessageEvent.tool_scope` +
 `gateway/run.py:_apply_tool_scope`; see `CORE_PATCH.md` at the project root).
-Entries are Hermes **toolset names** (e.g. `hermes-cli`, `web`, `memory`) —
+Entries are Hermes **toolset names** (e.g. `hermes-cli`, `web`, `memory`) -
 Hermes scopes tools by toolset, not individual tool name. `tools_by_sender`
 (matched on the verified account/nick, case-insensitive) overrides the
 channel-wide `tools`; `["*"]` means unrestricted. The narrowed toolset list
@@ -221,7 +221,7 @@ lines (attached as `channel_context` so replies are conversation-aware) and may
 *occasionally* contribute to unaddressed chatter. A reply fires only when
 `random() < spontaneous_probability` **and** at least `spontaneous_cooldown`
 seconds have passed since its last spontaneous post in that channel. The agent
-is prompted that it may stay silent — replying with exactly `<silent>` is
+is prompted that it may stay silent - replying with exactly `<silent>` is
 suppressed (no message sent). Addressed messages (`require_mention`) always get
 a reply. Env: `IRCX_OBSERVE_MODE`, `IRCX_SPONTANEOUS_PROBABILITY`,
 `IRCX_SPONTANEOUS_COOLDOWN`, `IRCX_CONTEXT_BUFFER`.
@@ -243,26 +243,26 @@ only trusted operators can direct joins.
 Two **read-only** tools (always available in the `ircx` toolset; no
 `allow_agent_join` required) let the agent answer questions about who's around:
 
-- `irc_channel_info` — the live roster of a channel the bot is in: the member
+- `irc_channel_info` - the live roster of a channel the bot is in: the member
   list (`@` for ops, `+` for voiced), total user / op / voice counts, and the
   topic. Use for "who is here?", "how many ops?", "what's the topic?".
-- `irc_whois` — what the bot knows about a specific user it shares a channel
+- `irc_whois` - what the bot knows about a specific user it shares a channel
   with: nick, ident/host, verified account (if any), away status, and shared
   channels.
 
 These read directly from the `ircstates` state machine (NAMES/`353`, WHO, MODE,
-TOPIC) — no extra round-trips in the common case. The bot must be a *member* of
+TOPIC) - no extra round-trips in the common case. The bot must be a *member* of
 a channel to see its roster.
 
 ### Channel membership events (who comes and goes)
 With `IRCX_SHOW_EVENTS=true` (default off), the bot surfaces **join / part /
 quit / kick / nick-change** events into the per-channel context buffer (and the
-on-disk log), so the agent can *see* who's coming and going — e.g. to greet a
+on-disk log), so the agent can *see* who's coming and going - e.g. to greet a
 returning friend or notice someone left. Events are recorded as plain context
 lines (`*** alice has joined #chan`); they are **never dispatched as a prompt**
 on their own (no reply storms), and the bot's own joins/parts are skipped.
 Quits and nick-changes are attributed to every channel the user shared with the
-bot. Noisy on large channels — leave it off there. Env: `IRCX_SHOW_EVENTS`.
+bot. Noisy on large channels - leave it off there. Env: `IRCX_SHOW_EVENTS`.
 
 ### Self-management & participation (agent tools)
 Further `ircx`-toolset tools give the agent the same everyday agency a human
@@ -270,34 +270,34 @@ IRC user has. None need `allow_agent_join`; the channel-state-changing ones
 (`irc_set_key`) enforce that the bot itself holds operator status, exactly like
 `irc_mode` / `irc_topic` / `irc_kick`.
 
-- `irc_away` — set or clear the bot's away status (signals "stepping back" /
+- `irc_away` - set or clear the bot's away status (signals "stepping back" /
   degraded state; visible on WHOIS).
-- `irc_whois_server` — a **network-wide** WHOIS that works even for users the
+- `irc_whois_server` - a **network-wide** WHOIS that works even for users the
   bot shares no channel with. Answers "is X online right now?" with their
   account, host, realname, server, idle time and channels (async request/reply
   on numerics 311/312/313/317/319/330/671/318, with a timeout).
-- `irc_cycle` — part then rejoin a channel to reset desynced state after a
+- `irc_cycle` - part then rejoin a channel to reset desynced state after a
   netsplit or lost op; the channel key is preserved across the cycle.
-- `irc_set_key` — first-class channel-key (`+k`) management; the key is
+- `irc_set_key` - first-class channel-key (`+k`) management; the key is
   remembered so reconnects rejoin with it. Requires the bot to be an operator.
-- `irc_ignore` / `irc_unignore` — temporarily mute a user: their messages are
+- `irc_ignore` / `irc_unignore` - temporarily mute a user: their messages are
   dropped (not answered, not buffered for context) until the timeout lapses,
   so it can't become permanent avoidance. Default 300 s, max 86400 s.
-- `irc_query` — message an IRC **service or bot** (NickServ, ChanServ, MemoServ,
+- `irc_query` - message an IRC **service or bot** (NickServ, ChanServ, MemoServ,
   or any bot nick) and get its reply back. Services answer by `NOTICE`, which the
   normal prompt path drops for loop-safety, so without this the agent is "talking
   blind." `irc_query` captures the reply (NOTICE *and* PRIVMSG, multi-line) for a
-  short window and returns it — letting the agent actually drive services
+  short window and returns it - letting the agent actually drive services
   (register/manage channels, send memos, read INFO) and command bots.
 
 ### Downtime context persistence
 IRC is stateless, but the **agent's own conversation memory persists** in
 Hermes' state DB across reconnects/restarts. What's missed is channel traffic
 *while the bot is offline*. Two mechanisms close that gap:
-- **`draft/chathistory`** — on (re)join, IRCX requests `CHATHISTORY LATEST
+- **`draft/chathistory`** - on (re)join, IRCX requests `CHATHISTORY LATEST
   <chan> * <limit>` where the server supports it; replayed backlog is fed into
   the context buffer (and never re-answered). Env: `IRCX_CHATHISTORY_LIMIT`.
-- **Logging mode** — set `IRCX_LOG_DIR` to append every channel line (with
+- **Logging mode** - set `IRCX_LOG_DIR` to append every channel line (with
   `server-time`) to a per-channel log; on (re)join the tail is replayed to seed
   the context buffer, so continuity survives even on servers without
   `chathistory`.

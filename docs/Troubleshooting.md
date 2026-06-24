@@ -4,7 +4,7 @@ Logs live in your profile's `logs/` dir (`gateway.log`, `agent.log`). Set `IRCX_
 
 ## Plugin doesn't load / platform missing
 
-- **`irctokens` / `ircstates` not installed** — the plugin disables itself with an install hint. Install into the *same* env your gateway runs from:
+- **`irctokens` / `ircstates` not installed** - the plugin disables itself with an install hint. Install into the *same* env your gateway runs from:
   `<hermes-venv>/bin/python -m pip install irctokens ircstates`
 - Confirm it's discovered: `ircx` should appear in `hermes status` / the platform registry once `IRCX_SERVER` + `IRCX_CHANNEL` are set.
 
@@ -28,9 +28,9 @@ Logs live in your profile's `logs/` dir (`gateway.log`, `agent.log`). Set `IRCX_
 
 ## Doesn't respond to messages
 
-- In channels, `require_mention` is **on** by default — address it by nick (`botnick: hi`). Add alternate names via `mention_aliases`.
+- In channels, `require_mention` is **on** by default - address it by nick (`botnick: hi`). Add alternate names via `mention_aliases`.
 - **Authorization**: by default only **verified accounts** are allowed. If you're testing, set `IRCX_ALLOW_ALL_USERS=true`, or add your account to `IRCX_ALLOWED_USERS`. See [Authentication and SASL](Authentication-and-SASL.md).
-- Via a **Matrix/heisenbridge** puppet, your IRC-side nick is the bridge puppet (e.g. `yourname`), not your Matrix handle — that's the identity the bot sees.
+- Via a **Matrix/heisenbridge** puppet, your IRC-side nick is the bridge puppet (e.g. `yourname`), not your Matrix handle - that's the identity the bot sees.
 
 ## SASL fails
 
@@ -40,7 +40,7 @@ Logs live in your profile's `logs/` dir (`gateway.log`, `agent.log`). Set `IRCX_
 ## Reconnect behaviour
 
 - On a dropped link or **ping timeout**, IRCX marks a retryable failure; Hermes' background reconnect watcher re-runs `connect()`, which re-auths and **rejoins all channels** (including ones added at runtime via `irc_join`).
-- The agent's conversation memory is **not** lost on reconnect — it's persisted in Hermes' state DB. Only messages sent *while offline* are missed; see persistence options in [Interactive Behaviours](Interactive-Behaviours.md).
+- The agent's conversation memory is **not** lost on reconnect - it's persisted in Hermes' state DB. Only messages sent *while offline* are missed; see persistence options in [Interactive Behaviours](Interactive-Behaviours.md).
 
 ## Spontaneous replies too frequent / never happen
 

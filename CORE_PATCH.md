@@ -3,14 +3,14 @@
 The IRCX plugin's per-channel / per-sender tool scoping
 (`groups.<chan>.tools` / `tools_by_sender`) is enforced by a small, generic,
 backward-compatible hook in two core Hermes files. Any platform adapter can
-use it — it is not IRC-specific.
+use it - it is not IRC-specific.
 
 These two files live in the Hermes repo (on the VPS at
 `~/.hermes/hermes-agent/`), not in this plugin directory. They are recorded
 here so the change is reviewable and upstreamable. Backups were saved to
 `/tmp/base.py.bak` and `/tmp/run.py.bak` before editing.
 
-## 1. `gateway/platforms/base.py` — new `MessageEvent` field
+## 1. `gateway/platforms/base.py` - new `MessageEvent` field
 
 Added after `internal: bool = False` in the `MessageEvent` dataclass:
 
@@ -26,7 +26,7 @@ Added after `internal: bool = False` in the `MessageEvent` dataclass:
 Backward compatible: defaults to `None` (no behavior change for any
 existing adapter).
 
-## 2. `gateway/run.py` — generic enforcement helper + call site
+## 2. `gateway/run.py` - generic enforcement helper + call site
 
 New module-level helper (inserted just before `_telegramize_command_mentions`):
 
@@ -64,12 +64,12 @@ Applied inside `_run_agent`, immediately after the existing
 `enabled_toolsets` is already part of the per-session agent-cache signature
 (`_agent_config_signature`), so narrowing it per message correctly produces a
 distinct cached agent when the scope differs (e.g. a restricted sender vs an
-unrestricted one in the same channel) — no stale-tool leakage.
+unrestricted one in the same channel) - no stale-tool leakage.
 
 ## Semantics
 
 - Entries are Hermes **toolset names** (e.g. `hermes-cli`, `web`, `memory`),
-  not individual tool names — Hermes groups tools into toolsets, and the
+  not individual tool names - Hermes groups tools into toolsets, and the
   agent only accepts toolset-level enable/disable.
 - `["*"]` or `None` = unrestricted.
 - `tools_by_sender[<identity>]` (matched on the verified account / nick,
@@ -80,9 +80,9 @@ unrestricted one in the same channel) — no stale-tool leakage.
 ## Tests
 
 `tests/gateway/test_ircx_adapter.py`:
-- `TestToolScopeCoreHelper` — the generic `_apply_tool_scope` (intersection,
+- `TestToolScopeCoreHelper` - the generic `_apply_tool_scope` (intersection,
   wildcard, none, order preservation) and the `MessageEvent.tool_scope` field.
-- `TestAdapterToolScope` — the adapter attaches the correct scope per
+- `TestAdapterToolScope` - the adapter attaches the correct scope per
   channel `tools`, per-sender `tools_by_sender` (with override + fallback),
   wildcard, no-config, and DM cases.
 
@@ -93,4 +93,4 @@ cp /tmp/base.py.bak ~/.hermes/hermes-agent/gateway/platforms/base.py
 cp /tmp/run.py.bak  ~/.hermes/hermes-agent/gateway/run.py
 ```
 (The plugin tolerates the revert: without the core hook, `tool_scope` is
-simply ignored and tool scoping is a no-op — everything else still works.)
+simply ignored and tool scoping is a no-op - everything else still works.)
