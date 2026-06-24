@@ -1,5 +1,5 @@
 """
-IRCX — IRCv3 Platform Adapter for Hermes Agent
+IRCX - IRCv3 Platform Adapter for Hermes Agent
 =========================================================
 
 A gateway platform adapter that connects Hermes to one or more IRC channels
@@ -14,7 +14,7 @@ Highlights
   ``SCRAM-SHA-256``.  Falls back to NickServ ``IDENTIFY`` when SASL is not
   configured.
 * **Verified-account authorization** via ``account-tag`` / ``extended-join`` /
-  ``account-notify`` — authorize by the network-verified account, not the
+  ``account-notify`` - authorize by the network-verified account, not the
   spoofable nick.  Bare-nick matching is opt-in
   (``dangerously_allow_name_matching``), mirroring OpenClaw's
   ``dangerouslyAllowNameMatching``.
@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # IRCv3 library stack (optional at import time so the module can still be
-# imported — and ``check_requirements`` can report a helpful install hint —
+# imported - and ``check_requirements`` can report a helpful install hint -
 # when the packages are not installed).
 # ---------------------------------------------------------------------------
 try:
@@ -226,6 +226,14 @@ class IRCXConfig:
     # --- Context persistence across disconnects (Feature C) ---
     log_dir: Optional[str] = None         # if set, log channel lines + replay tail
     chathistory_limit: int = 50           # CHATHISTORY LATEST fetch size on (re)join
+
+    # --- Interactive control commands (Feature D: ".ircx <cmd>" bridge) ---
+    commands_enabled: bool = True         # honor ".ircx <command>" control messages
+    command_prefix: str = ".ircx"         # user-facing prefix -> gateway slash commands
+
+    # --- Raw IRC (Feature E) ---
+    allow_raw: bool = False               # let the agent send raw IRC lines via irc_raw
+    raw_guardrails: str = "high"          # policy strictness when raw is on: high|medium|none
 
     # ---- derived helpers -------------------------------------------------
 
@@ -466,6 +474,17 @@ def load_config(platform_config: Any, env_prefix: str = "IRCX") -> IRCXConfig:
     except (TypeError, ValueError):
         cfg.chathistory_limit = 50
 
+    # --- Feature D: interactive PM/control command bridge (".ircx <cmd>") ---
+    ce_env = E("COMMANDS_ENABLED")
+    cfg.commands_enabled = _truthy(ce_env) if ce_env is not None else bool(extra.get("commands_enabled", True))
+    cfg.command_prefix = (E("COMMAND_PREFIX") or extra.get("command_prefix") or ".ircx").strip() or ".ircx"
+
+    # --- Feature E: raw IRC ---
+    ar_env = E("ALLOW_RAW")
+    cfg.allow_raw = _truthy(ar_env) if ar_env is not None else bool(extra.get("allow_raw", False))
+    _gr = (E("RAW_GUARDRAILS") or extra.get("raw_guardrails") or "high").strip().lower()
+    cfg.raw_guardrails = _gr if _gr in ("high", "medium", "none") else "high"
+
     return cfg
 
 
@@ -482,6 +501,38 @@ _C_RESET = "\x0f"
 def strip_irc_control_chars(text: str) -> str:
     """Strip CR/LF/NUL so user content can't inject IRC commands."""
     return text.replace("\r", " ").replace("\n", " ").replace("\x00", "")
+
+
+_GW_SLASH_RE = None
+
+
+def _gateway_slash_re():
+    """Cached regex matching a *known* gateway slash command reference
+    (``/whoami``, ``/model``…) as a standalone token - never a URL or path
+    segment (guards against a preceding/following word-char or '/')."""
+    global _GW_SLASH_RE
+    if _GW_SLASH_RE is not None:
+        return _GW_SLASH_RE
+    names = set()
+    try:
+        from hermes_cli.commands import COMMAND_REGISTRY  # type: ignore
+        for c in COMMAND_REGISTRY:
+            n = getattr(c, "name", None)
+            if n:
+                names.add(str(n).lower())
+            for al in (getattr(c, "aliases", None) or ()):
+                names.add(str(al).lower())
+    except Exception:
+        names = {"help", "model", "provider", "reset", "new", "clear", "reasoning",
+                 "whoami", "status", "usage", "voice", "sethome", "platform",
+                 "compress", "resume", "retry", "undo", "stop", "cron", "config",
+                 "profile", "commands"}
+    if not names:
+        _GW_SLASH_RE = re.compile(r"(?!x)x")  # matches nothing
+        return _GW_SLASH_RE
+    alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    _GW_SLASH_RE = re.compile(r"(?<![\w/])/(" + alt + r")(?![\w/])", re.IGNORECASE)
+    return _GW_SLASH_RE
 
 
 def _write_log_line(path: str, line: str) -> None:
@@ -508,7 +559,7 @@ def _strip_code_fences(text: str) -> str:
     ``re.DOTALL``. On IRC each rendered line stands alone, and a greedy
     ``.+?`` across newlines would let an unterminated ``**`` swallow an entire
     paragraph. Keeping ``.`` newline-bounded means a stray marker degrades to
-    a single literal char on one line — never a broken multi-line render.
+    a single literal char on one line - never a broken multi-line render.
     """
     return re.sub(r"```[\w+.\-/]*[ \t]*\n?", "", text)
 
@@ -849,20 +900,26 @@ class IRCClient:
                 await asyncio.sleep(0.2)
             except Exception:
                 pass
-        for task in (self._keepalive_task, self._recv_task, self._send_task):
-            if task and not task.done():
+        # Never cancel/await the task we're *running on*: disconnect() can be
+        # reached from inside the recv loop (the connection-lost path), and
+        # awaiting your own task raises "Task cannot await on itself". Skip it;
+        # it unwinds on its own once disconnect() returns.
+        current = asyncio.current_task()
+        tasks = [t for t in (self._keepalive_task, self._recv_task, self._send_task)
+                 if t and t is not current]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
-        for task in (self._keepalive_task, self._recv_task, self._send_task):
-            if task:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass  # expected: we cancelled it just above
-                except Exception:
-                    # A real crash in a loop (e.g. a parser bug) must not be
-                    # silently masked during shutdown — log it so it's
-                    # diagnosable instead of vanishing.
-                    logger.exception("IRCX: task crashed during disconnect")
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass  # expected: we cancelled it just above
+            except Exception:
+                # A real crash in a loop (e.g. a parser bug) must not be
+                # silently masked during shutdown, log it so it's
+                # diagnosable instead of vanishing.
+                logger.exception("IRCX: task crashed during disconnect")
         if self._writer:
             try:
                 self._writer.close()
@@ -1047,7 +1104,7 @@ class IRCClient:
             await self._handle_privmsg(line, is_notice=(command == "NOTICE"))
             return
 
-        # Membership events (join/part/quit/kick/nick) — surfaced to the agent's
+        # Membership events (join/part/quit/kick/nick) - surfaced to the agent's
         # channel context when show_events is on. ircstates has already updated
         # state in parse_tokens; we only narrate.
         if self.cfg.show_events and command in ("JOIN", "PART", "QUIT", "KICK", "NICK"):
@@ -1059,7 +1116,7 @@ class IRCClient:
             self._collect_whois(command, line.params)
             return
 
-        # BATCH open/close — track draft/chathistory batches (Feature C).
+        # BATCH open/close - track draft/chathistory batches (Feature C).
         if command == "BATCH" and line.params:
             ref = line.params[0]
             if ref.startswith("+"):
@@ -1070,7 +1127,7 @@ class IRCClient:
                 self._chathistory_batches.discard(ref[1:])
             return
 
-        # RPL_ENDOFNAMES (366) — channel fully joined; pull history (Feature C).
+        # RPL_ENDOFNAMES (366) - channel fully joined; pull history (Feature C).
         if command == "366" and len(line.params) >= 2:
             await self._request_chathistory(line.params[1])
             return
@@ -1204,7 +1261,7 @@ class IRCClient:
 
     async def _handle_nick_in_use(self) -> None:
         # Post-registration, a 433 means a *regain* attempt (in the keepalive
-        # loop) lost the race — someone still holds our configured nick. Don't
+        # loop) lost the race - someone still holds our configured nick. Don't
         # mangle our current working nick; just let the next regain tick retry.
         if self._registered_evt.is_set():
             logger.debug("IRCX: nick regain failed (433); will retry later")
@@ -1390,7 +1447,7 @@ class IRCClient:
         msgid = line.tags.get("msgid") if line.tags else None
 
         # draft/chathistory replay: messages inside a chathistory batch are
-        # backlog, not live — flag so the adapter buffers/logs but never
+        # backlog, not live - flag so the adapter buffers/logs but never
         # answers them (Feature C).
         batch_ref = line.tags.get("batch") if line.tags else None
         is_history = bool(batch_ref and batch_ref in self._chathistory_batches)
@@ -1547,7 +1604,7 @@ class IRCClient:
                     await asyncio.wait_for(slot["event"].wait(), timeout=wait)
                 except asyncio.TimeoutError:
                     if slot["lines"]:
-                        break  # quiet period elapsed after a reply — done
+                        break  # quiet period elapsed after a reply - done
                     break      # nothing arrived within the timeout
             return list(slot["lines"])
         finally:
@@ -1700,7 +1757,7 @@ class IRCXAdapter(BasePlatformAdapter):
             loop.run_in_executor(None, _write_log_line, path, line)
         except RuntimeError:
             # No running loop (e.g. unit tests calling _record_line directly):
-            # fall back to a direct write — there's no loop to block.
+            # fall back to a direct write - there's no loop to block.
             _write_log_line(path, line)
 
     def _record_event_msg(self, msg: Dict[str, Any]) -> None:
@@ -1834,7 +1891,7 @@ class IRCXAdapter(BasePlatformAdapter):
     async def _on_irc_disconnect(self, reason: str) -> None:
         if not self.is_connected:
             return
-        logger.warning("IRCX: %s — marking disconnected for reconnect", reason)
+        logger.warning("IRCX: %s - marking disconnected for reconnect", reason)
         self._set_fatal_error("connection_lost", f"IRC connection lost: {reason}", retryable=True)
         await self._notify_fatal_error()
 
@@ -1898,7 +1955,7 @@ class IRCXAdapter(BasePlatformAdapter):
         env_list = _coerce_str_list(_pfx_env(self._env_prefix, "ALLOWED_USERS", "IRC_ALLOWED_USERS"))
         if env_list:
             return ident_l in {a.lower() for a in env_list}
-        # No adapter-side allowlist configured — defer to the gateway's
+        # No adapter-side allowlist configured - defer to the gateway's
         # central _is_user_authorized (pairing / global allow-all).
         return True
 
@@ -1945,15 +2002,22 @@ class IRCXAdapter(BasePlatformAdapter):
         target = msg["target"]
         spontaneous = False
 
-        # Temporary mute: drop everything from an ignored nick — not recorded
+        # Temporary mute: drop everything from an ignored nick - not recorded
         # for context, not answered.  Replayed history is exempt (it predates
         # the mute and is never answered anyway).
         if not msg.get("is_history") and self._is_ignored(sender_nick):
             return
 
+        # Feature D: interactive control commands (".ircx <command>"). Honored in
+        # DMs and channels for authorized users; the prefix is explicit addressing
+        # so it bypasses the mention gate. Backlog replay never triggers commands.
+        if (self.cfg.commands_enabled and not msg.get("is_history")
+                and await self._maybe_handle_command(msg, sender_nick, text, is_channel, target)):
+            return
+
         if is_channel:
-            # Denylist: never engage in a blocked channel — not recorded, not
-            # answered — even if the bot somehow ends up in it (e.g. forced join).
+            # Denylist: never engage in a blocked channel - not recorded, not
+            # answered - even if the bot somehow ends up in it (e.g. forced join).
             if self._is_blocked_channel(target):
                 return
             # group_policy: in allowlist mode only handle configured channels.
@@ -2027,11 +2091,113 @@ class IRCXAdapter(BasePlatformAdapter):
             channel_context=self._format_context(chat_id) if is_channel else None,
         )
         # Attach tool scope as an instance attribute (not a constructor kwarg)
-        # so the plugin works on BOTH stock Hermes — where MessageEvent has no
-        # ``tool_scope`` field, so it's simply ignored — and patched Hermes,
+        # so the plugin works on BOTH stock Hermes - where MessageEvent has no
+        # ``tool_scope`` field, so it's simply ignored - and patched Hermes,
         # where CORE_PATCH.md adds the field + ``_apply_tool_scope`` enforcement.
         event.tool_scope = self._resolve_tool_scope(identity, is_channel, target)
         await self.handle_message(event)
+
+    async def _maybe_handle_command(self, msg: Dict[str, Any], sender_nick: str,
+                                    text: str, is_channel: bool, target: str) -> bool:
+        """Bridge a ``.ircx <command>`` control message to the gateway's central
+        slash-command pipeline (same commands Telegram/Slack expose: model,
+        reset, reasoning, whoami, status, …).
+
+        Returns True if the message was a command (handled or swallowed), False
+        to fall through to normal message handling. Authorized users only.
+        """
+        prefix = (self.cfg.command_prefix or ".ircx").strip()
+        plow = prefix.lower()
+        raw = (text or "").strip()
+        body_src = raw
+        if not raw.lower().startswith(plow):
+            # Tolerate a leading mention in channels: "Bot: .ircx <cmd>".
+            s2, addressed = self._strip_mention(text or "")
+            s2 = s2.strip()
+            if addressed and s2.lower().startswith(plow):
+                body_src = s2
+            else:
+                return False
+        # Require an exact prefix token (".ircx" or ".ircxfoo" must not match
+        # "ircxsomething"): next char must be whitespace or end-of-string.
+        rest = body_src[len(prefix):]
+        if rest and not rest[:1].isspace():
+            return False
+
+        # Only authorized identities may drive the gateway.
+        identity = self._resolve_identity(sender_nick, msg.get("account"))
+        if not self._is_authorized(identity, is_channel, target):
+            logger.debug("IRCX: ignoring %s command from unauthorized %s", prefix, sender_nick)
+            return True  # swallow - do not process as a normal prompt
+
+        body = rest.strip()
+        chat_id = target if is_channel else sender_nick
+
+        # Bare prefix or help → list the available commands.
+        if body == "" or body.split()[0].lower() in ("help", "commands", "?", "h"):
+            await self.send(chat_id, self._ircx_help_text())
+            return True
+
+        # Rewrite to a gateway slash command and dispatch through the normal
+        # MessageEvent path - the gateway resolves, access-checks, runs it, and
+        # routes the text reply back here via send().
+        slash_text = "/" + body
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_id,
+            chat_type="group" if is_channel else "dm",
+            user_id=identity or sender_nick,
+            user_name=sender_nick,
+            message_id=msg.get("msgid"),
+        )
+        event = MessageEvent(
+            text=slash_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=msg.get("msgid") or str(int(time.time() * 1000)),
+            timestamp=datetime.datetime.now(),
+        )
+        try:
+            event.tool_scope = self._resolve_tool_scope(identity, is_channel, target)
+        except Exception:
+            pass
+        logger.info("IRCX: bridging command %r -> %s (from %s)", body, slash_text, sender_nick)
+        await self.handle_message(event)
+        return True
+
+    def _ircx_help_text(self) -> str:
+        """Compact, IRC-friendly listing of the control commands, pulled from the
+        live gateway registry so it never drifts out of sync."""
+        prefix = self.cfg.command_prefix or ".ircx"
+        names: List[str] = []
+        try:
+            from hermes_cli.commands import COMMAND_REGISTRY  # type: ignore
+            for c in COMMAND_REGISTRY:
+                if getattr(c, "hidden", False):
+                    continue
+                n = getattr(c, "name", None)
+                if n:
+                    names.append(str(n))
+        except Exception:
+            names = ["model", "reasoning", "reset", "whoami", "status", "usage", "help"]
+        names = sorted(set(names))
+        return (
+            f"Interactive control commands - message me '{prefix} <command>' "
+            f"(works in a PM or in-channel; authorized users only). They drive the "
+            f"same controls as the gateway. Examples: '{prefix} model <name>', "
+            f"'{prefix} reset', '{prefix} reasoning high', '{prefix} whoami'. "
+            f"Available: " + ", ".join(names) + f". (Use '{prefix} <command>' to run one.)"
+        )
+
+    def _rewrite_slash_commands(self, text: str) -> str:
+        """Rewrite known gateway "/cmd" references in outbound text to the
+        IRC-native ".ircx cmd" form (e.g. "Use /whoami" -> "Use .ircx whoami",
+        "/platform resume ircx" -> ".ircx platform resume ircx"). Only known
+        command names are touched; URLs, file paths, and code are left intact."""
+        if not text or "/" not in text:
+            return text
+        prefix = self.cfg.command_prefix or ".ircx"
+        return _gateway_slash_re().sub(lambda m: f"{prefix} {m.group(1)}", text)
 
     def _should_chime_in(self, target: str) -> bool:
         """Probability + per-channel cooldown gate for spontaneous replies."""
@@ -2066,6 +2232,12 @@ class IRCXAdapter(BasePlatformAdapter):
         # Observe-mode silence opt-out: the agent declined to contribute.
         if content.strip() in ("<silent>", "&lt;silent&gt;"):
             return SendResult(success=True, message_id="silent")
+
+        # Keep the command interface consistent: gateway help/error text refers to
+        # commands as "/cmd", but on IRC they're invoked as ".ircx cmd" - rewrite
+        # known-command refs so what users read matches how they type.
+        if self.cfg.commands_enabled:
+            content = self._rewrite_slash_commands(content)
 
         lines = split_message(
             content, chat_id, self.cfg.max_message_length,
@@ -2133,7 +2305,7 @@ class IRCXAdapter(BasePlatformAdapter):
             return f"invalid channel name: {channel!r}"
         if any(c in channel for c in ("\r", "\n", "\x00", " ")):
             return "channel name contains illegal characters"
-        # Denylist wins over everything — never join a blocked channel, even on request.
+        # Denylist wins over everything - never join a blocked channel, even on request.
         if self._is_blocked_channel(channel):
             return f"{channel} is on the IRCX_BLOCKED_CHANNELS denylist"
         if self.cfg.joinable_channels:
@@ -2201,7 +2373,7 @@ class IRCXAdapter(BasePlatformAdapter):
             return {"error": f"not in channel {target} (the bot must be a member to see its users)"}
         info = self._client.channel_info(target)
         if info is None:
-            return {"error": f"no state for {target} yet — try again in a moment"}
+            return {"error": f"no state for {target} yet - try again in a moment"}
         return {"success": True, **info}
 
     async def runtime_whois(self, nick: str) -> Dict[str, Any]:
@@ -2446,6 +2618,53 @@ class IRCXAdapter(BasePlatformAdapter):
         existed = self._ignored.pop(nick.lower(), None) is not None
         return {"success": True, "nick": nick, "was_ignored": existed}
 
+    # ---- raw IRC (Feature E) ---------------------------------------------
+    _RAW_BLOCKED_VERBS = {
+        "OPER", "KILL", "DIE", "RESTART", "SQUIT", "CONNECT", "REHASH", "WALLOPS",
+        "GLOBOPS", "GLINE", "KLINE", "ZLINE", "DLINE", "RKLINE", "ELINE",
+        "SAJOIN", "SAPART", "SANICK", "SAMODE", "SAQUIT", "SATOPIC", "CHGHOST", "OJOIN",
+    }
+
+    async def runtime_raw(self, command: str) -> Dict[str, Any]:
+        """Send a raw IRC protocol line. Gated by IRCX_ALLOW_RAW (off by default).
+
+        Policy strictness is set by IRCX_RAW_GUARDRAILS:
+          high   - refuse operator/server-destructive verbs (OPER, KILL, DIE,
+                   SQUIT, *LINE, SA*, ...) AND refuse JOIN to IRCX_BLOCKED_CHANNELS
+          medium - refuse JOIN to IRCX_BLOCKED_CHANNELS only (verbs allowed)
+          none   - no policy guards (any verb, any channel)
+
+        Regardless of level, CR/LF/NUL are always stripped (no command injection)
+        and the line is length-capped: that is protocol integrity, not policy.
+        """
+        if not self.cfg.allow_raw:
+            return {"error": "raw IRC is disabled; set IRCX_ALLOW_RAW=true to enable irc_raw"}
+        if not self._client or not self.is_connected:
+            return {"error": "not connected"}
+        raw = strip_irc_control_chars(command or "").strip()
+        if not raw:
+            return {"error": "empty command"}
+        if len(raw.encode("utf-8", "replace")) > 480:
+            return {"error": "command too long for a single IRC line (max ~480 bytes)"}
+        try:
+            line = irctokens.tokenise(raw)
+        except Exception as exc:
+            return {"error": "could not parse IRC line: %s" % exc}
+        verb = (line.command or "").upper()
+        if not verb:
+            return {"error": "no command verb"}
+        level = self.cfg.raw_guardrails
+        if level == "high" and verb in self._RAW_BLOCKED_VERBS:
+            return {"error": "refused (guardrails=high): %s is an operator/server-destructive "
+                             "command. Lower IRCX_RAW_GUARDRAILS to allow it." % verb}
+        if level in ("high", "medium") and verb == "JOIN" and line.params:
+            blocked = [t for t in line.params[0].split(",") if t and self._is_blocked_channel(t)]
+            if blocked:
+                return {"error": "refused (guardrails=%s): %s is in IRCX_BLOCKED_CHANNELS "
+                                 "(never-join)" % (level, ", ".join(blocked))}
+        self._client.send_line(line.command, line.params)
+        return {"success": True, "sent": raw, "command": verb, "guardrails": level}
+
     def _is_ignored(self, nick):
         import time as _t
         exp = self._ignored.get((nick or "").lower())
@@ -2464,7 +2683,7 @@ def _live_ircx_adapter() -> Optional["IRCXAdapter"]:
     """Fetch the running IRCXAdapter from the in-process gateway, if any.
 
     Network-aware: when several ircx instances run in one gateway (multi-network),
-    resolve the adapter for the platform of the *current turn* — so a tool acts on
+    resolve the adapter for the platform of the *current turn* - so a tool acts on
     whichever network the agent was addressed in. Falls back to the primary ``ircx``.
     """
     try:
@@ -2626,6 +2845,15 @@ def _ircx_search_history_tool(args: dict, **kwargs) -> str:
     return json.dumps(res)
 
 
+def _ircx_raw_tool(args: dict, **kwargs) -> str:
+    import json
+    adapter = _live_ircx_adapter()
+    if adapter is None:
+        return json.dumps({"error": "IRC not connected in this process"})
+    res = _run_adapter_coro(adapter, adapter.runtime_raw(str(args.get("command", ""))))
+    return json.dumps(res)
+
+
 def _ircx_away_tool(args: dict, **kwargs) -> str:
     import json
     adapter = _live_ircx_adapter()
@@ -2707,7 +2935,7 @@ def _run_adapter_coro(adapter, coro, timeout: float = 30.0):
     Hermes dispatches tools inside a ThreadPoolExecutor worker thread (see
     agent/tool_executor.py), so there is normally no running loop in this
     thread. The coroutine touches the client's send queue and StreamWriter,
-    which are bound to the gateway's event loop — running it on any *other*
+    which are bound to the gateway's event loop - running it on any *other*
     loop (e.g. a throwaway ``asyncio.run`` loop) is cross-loop-unsafe. So we
     schedule it onto the loop the client captured at connect() time and block
     this worker thread for the result.
@@ -2715,7 +2943,7 @@ def _run_adapter_coro(adapter, coro, timeout: float = 30.0):
     This cannot deadlock: we run on a worker thread, never the loop thread,
     so blocking here does not stop the loop from ticking. If, unexpectedly,
     we ARE on the gateway loop thread, ``run_coroutine_threadsafe`` would
-    deadlock — so we detect that and fall back to a fresh loop instead.
+    deadlock - so we detect that and fall back to a fresh loop instead.
     """
     client = getattr(adapter, "_client", None)
     loop = getattr(client, "_loop", None) if client is not None else None
@@ -2763,6 +2991,28 @@ _IRCX_TOOL_SCHEMAS = {
                 "reason": {"type": "string", "description": "Optional part message"},
             },
             "required": ["channel"],
+        },
+    },
+    "irc_raw": {
+        "name": "irc_raw",
+        "description": (
+            "Send a raw IRC protocol line (requires operator opt-in via "
+            "IRCX_ALLOW_RAW). For advanced or uncommon commands not covered by the "
+            "other tools, e.g. 'MODE #chan +b mask', 'INVITE nick #chan', 'WHO #chan', "
+            "'LIST', 'KNOCK #chan'. Guardrail strictness is set by IRCX_RAW_GUARDRAILS "
+            "(high|medium|none): at 'high', operator/server-destructive verbs (OPER, "
+            "KILL, DIE, *LINE, SA*) and JOINs to IRCX_BLOCKED_CHANNELS are refused. "
+            "CR/LF are always stripped."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "One raw IRC line, e.g. 'MODE #chan +o someone' or 'WHO #chan'.",
+                },
+            },
+            "required": ["command"],
         },
     },
     "irc_say": {
@@ -2923,7 +3173,7 @@ _IRCX_TOOL_SCHEMAS = {
         "name": "irc_away",
         "description": (
             "Set or clear the bot's IRC away status. Provide 'message' to mark "
-            "away (signals you're stepping back or degraded — clients show it on "
+            "away (signals you're stepping back or degraded - clients show it on "
             "WHOIS and when someone messages you); omit/empty 'message' to return."
         ),
         "parameters": {
@@ -2968,7 +3218,7 @@ _IRCX_TOOL_SCHEMAS = {
     "irc_whois_server": {
         "name": "irc_whois_server",
         "description": (
-            "Network-wide WHOIS lookup of a nick — works even for users the bot "
+            "Network-wide WHOIS lookup of a nick - works even for users the bot "
             "does NOT share a channel with. Answers 'is X online right now?' and "
             "returns their account, host, realname, server, idle time and "
             "channels. Returns an error if the nick is offline."
@@ -2983,7 +3233,7 @@ _IRCX_TOOL_SCHEMAS = {
         "name": "irc_query",
         "description": (
             "Send a private message to a service or bot (e.g. NickServ, ChanServ, "
-            "MemoServ, or any bot nick) and return its reply — including NOTICE "
+            "MemoServ, or any bot nick) and return its reply - including NOTICE "
             "replies, which services use and which normal messages never surface. "
             "Use this to drive IRC services: register/manage channels, send memos, "
             "check INFO, etc. Returns the reply lines (often multi-line)."
@@ -3152,7 +3402,7 @@ def interactive_setup() -> None:
     print_info("IRCv3 gateway. SASL-capable, multi-channel, account-verified auth.")
     server = prompt("IRC server hostname (e.g. irc.libera.chat)", default=existing or "")
     if not server:
-        print_warning("Server is required — skipping IRCX setup")
+        print_warning("Server is required - skipping IRCX setup")
         return
     save_env_value("IRCX_SERVER", server.strip())
 
@@ -3164,18 +3414,18 @@ def interactive_setup() -> None:
         try:
             save_env_value("IRCX_PORT", str(int(port)))
         except ValueError:
-            print_warning(f"Invalid port — using default {default_port}")
+            print_warning(f"Invalid port - using default {default_port}")
 
     nickname = prompt("Bot nickname (e.g. hermes-bot)", default=get_env_value("IRCX_NICKNAME") or "")
     if not nickname:
-        print_warning("Nickname is required — skipping IRCX setup")
+        print_warning("Nickname is required - skipping IRCX setup")
         return
     save_env_value("IRCX_NICKNAME", nickname.strip())
 
     channel = prompt("Channel(s) to join (comma-separated, '#chan key' for keyed)",
                      default=get_env_value("IRCX_CHANNEL") or "")
     if not channel:
-        print_warning("Channel is required — skipping IRCX setup")
+        print_warning("Channel is required - skipping IRCX setup")
         return
     save_env_value("IRCX_CHANNEL", channel.strip())
 
@@ -3201,7 +3451,7 @@ def interactive_setup() -> None:
     print_info("   By default only network-verified accounts are authorized.")
     if prompt_yes_no("Allow all users (dev only)?", False):
         save_env_value("IRCX_ALLOW_ALL_USERS", "true")
-        print_warning("⚠️  Open access — anyone may command the bot.")
+        print_warning("⚠️  Open access - anyone may command the bot.")
     else:
         save_env_value("IRCX_ALLOW_ALL_USERS", "false")
         allowed = prompt("Allowed accounts/nicks (comma-separated)",
@@ -3215,7 +3465,7 @@ def interactive_setup() -> None:
 
 _PLATFORM_HINT = (
     "You are chatting via IRC. IRC does not support markdown rendering "
-    "— use plain text. Long messages are automatically split into "
+    "- use plain text. Long messages are automatically split into "
     "~450-character lines. In channels users address you by prefixing "
     "your nick. Keep responses concise and conversational. You have "
     "irc_join / irc_part / irc_say / irc_list_channels tools to manage "
@@ -3227,7 +3477,7 @@ _PLATFORM_HINT = (
     "desynced channel, irc_set_key to manage a channel password, and "
     "irc_ignore to briefly mute someone (it lapses on its own). To talk "
     "to IRC services or bots (NickServ, ChanServ, MemoServ, etc.) use "
-    "irc_query — it sends them a message and returns their reply "
+    "irc_query - it sends them a message and returns their reply "
     "(including NOTICE replies, which you otherwise can't see). If you are "
     "connected to multiple IRC networks, each is a separate platform; reply "
     "on whichever network you were addressed in."
@@ -3235,7 +3485,7 @@ _PLATFORM_HINT = (
 
 
 def _register_network(ctx: Any, platform_name: str, env_prefix: str, label: str) -> None:
-    """Register one ircx platform instance — the primary (``ircx`` / ``IRCX_*``)
+    """Register one ircx platform instance - the primary (``ircx`` / ``IRCX_*``)
     or an extra network (``ircx-<net>`` / ``IRCX_<NET>_*``). Extra networks run
     in the same gateway/profile, so they share the agent's memory and context;
     the default ``IRCX`` prefix keeps the primary instance byte-identical."""
@@ -3267,7 +3517,7 @@ def _register_network(ctx: Any, platform_name: str, env_prefix: str, label: str)
 
 
 def register(ctx: Any) -> None:
-    """Plugin entry point — called by the Hermes plugin system."""
+    """Plugin entry point - called by the Hermes plugin system."""
     _register_network(ctx, "ircx", "IRCX", "IRC")
 
     # Additional IRC networks in the SAME gateway (shared agent memory):
@@ -3303,6 +3553,7 @@ def register(ctx: Any) -> None:
             ("irc_query", _ircx_query_tool),
             ("irc_ignore", _ircx_ignore_tool),
             ("irc_unignore", _ircx_unignore_tool),
+            ("irc_raw", _ircx_raw_tool),
         ):
             try:
                 _register(

@@ -1,7 +1,7 @@
 name: ircx-platform
 label: IRC
 kind: platform
-version: 1.7.0
+version: 1.9.0
 description: >
   Full-featured IRCv3 gateway adapter for Hermes Agent.  Connects to one or
   more IRC channels (and DMs) and relays messages to/from the Hermes agent.
@@ -156,7 +156,7 @@ optional_env:
     prompt: "Joinable channels (comma-separated)"
     password: false
   - name: IRCX_BLOCKED_CHANNELS
-    description: "Comma-separated denylist of channels the bot must NEVER join — wins over everything (auto-join, agent join-on-request, even an allowlist). It is also never auto-joined and never answered in. Use to permanently ban a channel (e.g. a costly public one)."
+    description: "Comma-separated denylist of channels the bot must NEVER join - wins over everything (auto-join, agent join-on-request, even an allowlist). It is also never auto-joined and never answered in. Use to permanently ban a channel (e.g. a costly public one)."
     prompt: "Blocked channels (comma-separated)"
     password: false
   # ── Context persistence across disconnects ──
@@ -171,4 +171,22 @@ optional_env:
   - name: IRCX_ALLOW_AGENT_KICK
     description: "Allow the agent to KICK users via the irc_kick tool (still requires the bot to be a channel operator). Default: false."
     prompt: "Allow agent to kick? (true/false)"
+    password: false
+  # ── Interactive control commands ──
+  - name: IRCX_COMMANDS_ENABLED
+    description: "Honor '.ircx <command>' control messages (PM the bot, or in-channel) that bridge to the gateway's slash commands (model, reset, reasoning, whoami, status, …). Authorized users only. Default: true."
+    prompt: "Enable .ircx control commands? (true/false)"
+    password: false
+  - name: IRCX_COMMAND_PREFIX
+    description: "Prefix that marks a control command (default: '.ircx'). e.g. '.ircx model <name>'. IRC clients eat a leading '/', so a non-slash prefix is used."
+    prompt: "Command prefix"
+    password: false
+  # -- Raw IRC --
+  - name: IRCX_ALLOW_RAW
+    description: "Allow the agent to send raw IRC protocol lines via the irc_raw tool (MODE, INVITE, WHO, LIST, KNOCK, services, etc.). Default: false."
+    prompt: "Allow raw IRC commands? (true/false)"
+    password: false
+  - name: IRCX_RAW_GUARDRAILS
+    description: "Policy strictness for irc_raw when enabled (default: high). 'high' = refuse operator/server-destructive verbs (OPER, KILL, DIE, *LINE, SA*) AND refuse JOIN to IRCX_BLOCKED_CHANNELS. 'medium' = refuse JOIN to IRCX_BLOCKED_CHANNELS only. 'none' = no policy guards (any verb, any channel). CR/LF stripping and length-capping always apply at every level (protocol integrity)."
+    prompt: "Raw guardrail level (high/medium/none)"
     password: false
