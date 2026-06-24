@@ -227,9 +227,10 @@ class IRCXConfig:
     log_dir: Optional[str] = None         # if set, log channel lines + replay tail
     chathistory_limit: int = 50           # CHATHISTORY LATEST fetch size on (re)join
 
-    # --- Interactive control commands (Feature D: ".ircx <cmd>" bridge) ---
-    commands_enabled: bool = True         # honor ".ircx <command>" control messages
-    command_prefix: str = ".ircx"         # user-facing prefix -> gateway slash commands
+    # --- Interactive control commands (Feature D) ---
+    commands_enabled: bool = True         # honor the control-message prefixes
+    command_prefix: str = ".agent"        # ".agent <cmd>" -> gateway/agent slash commands
+    admin_prefix: str = ".ircx"           # ".ircx <cmd>" -> live adapter config (this plugin)
 
     # --- Raw IRC (Feature E) ---
     allow_raw: bool = False               # let the agent send raw IRC lines via irc_raw
@@ -477,7 +478,8 @@ def load_config(platform_config: Any, env_prefix: str = "IRCX") -> IRCXConfig:
     # --- Feature D: interactive PM/control command bridge (".ircx <cmd>") ---
     ce_env = E("COMMANDS_ENABLED")
     cfg.commands_enabled = _truthy(ce_env) if ce_env is not None else bool(extra.get("commands_enabled", True))
-    cfg.command_prefix = (E("COMMAND_PREFIX") or extra.get("command_prefix") or ".ircx").strip() or ".ircx"
+    cfg.command_prefix = (E("COMMAND_PREFIX") or extra.get("command_prefix") or ".agent").strip() or ".agent"
+    cfg.admin_prefix = (E("ADMIN_PREFIX") or extra.get("admin_prefix") or ".ircx").strip() or ".ircx"
 
     # --- Feature E: raw IRC ---
     ar_env = E("ALLOW_RAW")
@@ -533,6 +535,122 @@ def _gateway_slash_re():
     alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
     _GW_SLASH_RE = re.compile(r"(?<![\w/])/(" + alt + r")(?![\w/])", re.IGNORECASE)
     return _GW_SLASH_RE
+
+
+# ---------------------------------------------------------------------------
+# Live adapter configuration: ".ircx" admin commands + ircx.env persistence.
+# SUFFIX -> (type, apply). "hot" = applied live; "restart" = persisted but needs
+# ".ircx restart" to take effect (connection-level). Secrets are never settable
+# in chat and are masked by ".ircx get".
+# ---------------------------------------------------------------------------
+_IRCX_SETTINGS = {
+    "SERVER": ("str", "restart"), "PORT": ("int", "restart"),
+    "USE_TLS": ("bool", "restart"), "TLS_VERIFY": ("bool", "restart"),
+    "NICKNAME": ("str", "restart"), "USERNAME": ("str", "restart"),
+    "REALNAME": ("str", "restart"), "CHANNEL": ("list", "restart"),
+    "NETWORKS": ("list", "restart"), "SASL_MECHANISM": ("str", "restart"),
+    "SASL_USERNAME": ("str", "restart"), "NICKSERV_SERVICE": ("str", "restart"),
+    "TLS_CLIENT_CERT": ("str", "restart"), "TLS_CLIENT_KEY": ("str", "restart"),
+    "LOG_DIR": ("str", "restart"), "CONTEXT_BUFFER": ("int", "restart"),
+    "HOME_CHANNEL": ("str", "restart"),
+    "DANGEROUSLY_ALLOW_NAME_MATCHING": ("bool", "restart"),
+    "REQUIRE_MENTION": ("bool", "hot"), "GROUP_POLICY": ("str", "hot"),
+    "OBSERVE_MODE": ("bool", "hot"), "SPONTANEOUS_PROBABILITY": ("float", "hot"),
+    "SPONTANEOUS_COOLDOWN": ("int", "hot"), "MAX_MESSAGE_LENGTH": ("int", "hot"),
+    "SHOW_EVENTS": ("bool", "hot"), "ALLOW_AGENT_JOIN": ("bool", "hot"),
+    "JOINABLE_CHANNELS": ("list", "hot"), "BLOCKED_CHANNELS": ("list", "hot"),
+    "ALLOW_AGENT_KICK": ("bool", "hot"), "CHATHISTORY_LIMIT": ("int", "hot"),
+    "COMMANDS_ENABLED": ("bool", "hot"), "COMMAND_PREFIX": ("str", "hot"),
+    "ADMIN_PREFIX": ("str", "hot"), "ALLOW_RAW": ("bool", "hot"),
+    "RAW_GUARDRAILS": ("str", "hot"), "ALLOWED_USERS": ("list", "hot"),
+    "ALLOW_ALL_USERS": ("bool", "hot"),
+}
+_IRCX_SECRETS = {"SERVER_PASSWORD", "SASL_PASSWORD", "NICKSERV_PASSWORD"}
+_IRCX_ENUMS = {
+    "GROUP_POLICY": ("allowlist", "open"),
+    "RAW_GUARDRAILS": ("high", "medium", "none"),
+    "SASL_MECHANISM": ("PLAIN", "EXTERNAL", "SCRAM-SHA-256"),
+}
+# cfg fields re-applied live (re-derived via load_config) after a hot change
+_HOT_CFG_ATTRS = (
+    "require_mention", "group_policy", "observe_mode", "spontaneous_probability",
+    "spontaneous_cooldown", "max_message_length", "show_events", "allow_agent_join",
+    "joinable_channels", "blocked_channels", "allow_agent_kick", "chathistory_limit",
+    "commands_enabled", "command_prefix", "admin_prefix", "allow_raw", "raw_guardrails",
+    "allow_from",
+)
+
+
+def _ircx_config_path() -> Optional[str]:
+    return (os.environ.get("IRCX_CONFIG_FILE") or "").strip() or None
+
+
+def _load_ircx_env_file() -> int:
+    """Overlay the IRCX_CONFIG_FILE dotenv onto os.environ (file values win, so
+    ``.ircx set`` persistence takes effect on the next load). Returns count."""
+    path = _ircx_config_path()
+    if not path or not os.path.exists(path):
+        return 0
+    n = 0
+    try:
+        for ln in open(path, encoding="utf-8"):
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            os.environ[k.strip()] = v.strip()
+            n += 1
+    except OSError:
+        pass
+    return n
+
+
+def _ircx_envfile_set(key: str, value: str) -> bool:
+    """Persist KEY=value into IRCX_CONFIG_FILE (replace or append the line)."""
+    path = _ircx_config_path()
+    if not path:
+        return False
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
+        for i, ln in enumerate(lines):
+            if ln.split("=", 1)[0].strip() == key:
+                lines[i] = f"{key}={value}"
+                break
+        else:
+            lines.append(f"{key}={value}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def _ircx_coerce(typ: str, value: str, suffix: str):
+    """Validate/normalise a setting value. Returns (ok, normalised_str, error)."""
+    value = (value or "").strip()
+    if suffix in _IRCX_ENUMS:
+        allowed = _IRCX_ENUMS[suffix]
+        match = next((a for a in allowed if a.lower() == value.lower()), None)
+        return (True, match, None) if match else (False, None, "must be one of " + ", ".join(allowed))
+    if typ == "bool":
+        if value.lower() in ("true", "1", "yes", "on"):
+            return True, "true", None
+        if value.lower() in ("false", "0", "no", "off"):
+            return True, "false", None
+        return False, None, "expected true/false"
+    if typ == "int":
+        try:
+            return True, str(int(value)), None
+        except ValueError:
+            return False, None, "expected an integer"
+    if typ == "float":
+        try:
+            return True, str(float(value)), None
+        except ValueError:
+            return False, None, "expected a number"
+    if typ == "list":
+        return True, ",".join(x.strip() for x in value.split(",") if x.strip()), None
+    return True, value, None  # str
 
 
 def _write_log_line(path: str, line: str) -> None:
@@ -1719,6 +1837,7 @@ class IRCXAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform(platform_name))
         self._env_prefix = env_prefix
         self._platform_name = platform_name
+        self._platform_config = config  # kept so hot ".ircx set" can re-derive cfg
         self.cfg = load_config(config, env_prefix=env_prefix)
         self._client: Optional[IRCClient] = None
         self._lock_key: Optional[str] = None
@@ -2008,12 +2127,15 @@ class IRCXAdapter(BasePlatformAdapter):
         if not msg.get("is_history") and self._is_ignored(sender_nick):
             return
 
-        # Feature D: interactive control commands (".ircx <command>"). Honored in
-        # DMs and channels for authorized users; the prefix is explicit addressing
-        # so it bypasses the mention gate. Backlog replay never triggers commands.
-        if (self.cfg.commands_enabled and not msg.get("is_history")
-                and await self._maybe_handle_command(msg, sender_nick, text, is_channel, target)):
-            return
+        # Interactive control prefixes (authorized users; explicit addressing, so
+        # the mention gate is bypassed; never on backlog replay):
+        #   ".agent <cmd>"  -> gateway/agent slash commands (model, reset, ...)
+        #   ".ircx  <cmd>"  -> live config for this IRC adapter
+        if self.cfg.commands_enabled and not msg.get("is_history"):
+            if await self._maybe_handle_ircx_command(msg, sender_nick, text, is_channel, target):
+                return
+            if await self._maybe_handle_command(msg, sender_nick, text, is_channel, target):
+                return
 
         if is_channel:
             # Denylist: never engage in a blocked channel - not recorded, not
@@ -2166,9 +2288,9 @@ class IRCXAdapter(BasePlatformAdapter):
         return True
 
     def _ircx_help_text(self) -> str:
-        """Compact, IRC-friendly listing of the control commands, pulled from the
-        live gateway registry so it never drifts out of sync."""
-        prefix = self.cfg.command_prefix or ".ircx"
+        """Compact, IRC-friendly listing of the agent/gateway control commands,
+        pulled from the live registry so it never drifts out of sync."""
+        prefix = self.cfg.command_prefix or ".agent"
         names: List[str] = []
         try:
             from hermes_cli.commands import COMMAND_REGISTRY  # type: ignore
@@ -2186,7 +2308,8 @@ class IRCXAdapter(BasePlatformAdapter):
             f"(works in a PM or in-channel; authorized users only). They drive the "
             f"same controls as the gateway. Examples: '{prefix} model <name>', "
             f"'{prefix} reset', '{prefix} reasoning high', '{prefix} whoami'. "
-            f"Available: " + ", ".join(names) + f". (Use '{prefix} <command>' to run one.)"
+            f"Available: " + ", ".join(names) + f". (Use '{prefix} <command>' to run one.) "
+            f"For IRC adapter settings instead, use '{self.cfg.admin_prefix} help'."
         )
 
     def _rewrite_slash_commands(self, text: str) -> str:
@@ -2198,6 +2321,124 @@ class IRCXAdapter(BasePlatformAdapter):
             return text
         prefix = self.cfg.command_prefix or ".ircx"
         return _gateway_slash_re().sub(lambda m: f"{prefix} {m.group(1)}", text)
+
+    # ---- live adapter config (".ircx" admin commands, Feature F) ---------
+    async def _maybe_handle_ircx_command(self, msg: Dict[str, Any], sender_nick: str,
+                                         text: str, is_channel: bool, target: str) -> bool:
+        """Handle ".ircx <subcommand>" for live configuration of THIS adapter
+        (the network the message arrived on). Returns True if handled/swallowed."""
+        prefix = (self.cfg.admin_prefix or ".ircx").strip()
+        plow = prefix.lower()
+        raw = (text or "").strip()
+        if not raw.lower().startswith(plow):
+            s2, addressed = self._strip_mention(text or "")
+            s2 = s2.strip()
+            if addressed and s2.lower().startswith(plow):
+                raw = s2
+            else:
+                return False
+        rest = raw[len(prefix):]
+        if rest and not rest[:1].isspace():
+            return False
+        identity = self._resolve_identity(sender_nick, msg.get("account"))
+        if not self._is_authorized(identity, is_channel, target):
+            logger.debug("IRCX: ignoring %s admin command from unauthorized %s", prefix, sender_nick)
+            return True
+        chat_id = target if is_channel else sender_nick
+        args = rest.strip().split()
+        sub = args[0].lower() if args else "help"
+        if sub in ("help", "?", "h"):
+            await self.send(chat_id, self._ircx_admin_help())
+        elif sub in ("get", "list", "show"):
+            await self.send(chat_id, self._ircx_settings_dump(args[1] if len(args) > 1 else None))
+        elif sub == "restart":
+            await self.send(chat_id, self._ircx_admin_restart())
+        elif sub == "set":
+            if len(args) < 3:
+                await self.send(chat_id, f"usage: {prefix} set <key> <value>")
+            else:
+                await self.send(chat_id, self._ircx_admin_set(args[1], " ".join(args[2:])))
+        else:
+            await self.send(chat_id, f"unknown {prefix} subcommand '{sub}'. Try '{prefix} help'.")
+        return True
+
+    def _ircx_admin_help(self) -> str:
+        p = self.cfg.admin_prefix or ".ircx"
+        ap = self.cfg.command_prefix or ".agent"
+        return (
+            f"{p} configures THIS IRC adapter ({self._platform_name}) live. Subcommands: "
+            f"'{p} list' (all keys + values), '{p} get <key>', '{p} set <key> <value>', "
+            f"'{p} restart'. Hot keys apply instantly; connection keys (server, port, "
+            f"nickname, channel, networks, sasl_*, log_dir, context_buffer) save but need "
+            f"'{p} restart'. Secrets (passwords) are masked and cannot be set here. "
+            f"For agent/model controls use '{ap} <command>' (e.g. '{ap} model <name>')."
+        )
+
+    def _ircx_norm_suffix(self, key: str) -> str:
+        s = (key or "").upper()
+        for pre in (self._env_prefix + "_", "IRCX_"):
+            if s.startswith(pre):
+                return s[len(pre):]
+        return s
+
+    def _ircx_settings_dump(self, key: Optional[str] = None) -> str:
+        def cur(suffix: str) -> str:
+            v = _pfx_env(self._env_prefix, suffix)
+            if suffix in _IRCX_SECRETS:
+                return "***set***" if v else "(unset)"
+            return v if (v is not None and v != "") else "(unset)"
+        if key:
+            suffix = self._ircx_norm_suffix(key)
+            if suffix not in _IRCX_SETTINGS and suffix not in _IRCX_SECRETS:
+                return f"unknown key '{key}'. Use '{self.cfg.admin_prefix} list'."
+            tag = "secret" if suffix in _IRCX_SECRETS else _IRCX_SETTINGS[suffix][1]
+            return f"{suffix.lower()} = {cur(suffix)}  [{tag}]"
+        lines = [f"{self._platform_name} settings (env prefix {self._env_prefix}):"]
+        for s in sorted(set(_IRCX_SETTINGS) | _IRCX_SECRETS):
+            tag = "secret" if s in _IRCX_SECRETS else _IRCX_SETTINGS[s][1]
+            lines.append(f"  {s.lower()} = {cur(s)}  [{tag}]")
+        return "\n".join(lines)
+
+    def _ircx_admin_set(self, key: str, value: str) -> str:
+        p = self.cfg.admin_prefix or ".ircx"
+        suffix = self._ircx_norm_suffix(key)
+        if suffix in _IRCX_SECRETS:
+            return (f"'{suffix.lower()}' is a secret and is kept out of chat; manage it in .env. "
+                    f"({p} never sets or echoes passwords.)")
+        if suffix not in _IRCX_SETTINGS:
+            return f"unknown key '{key}'. Use '{p} list'."
+        typ, apply = _IRCX_SETTINGS[suffix]
+        ok, norm, err = _ircx_coerce(typ, value, suffix)
+        if not ok:
+            return f"invalid value for {suffix.lower()}: {err}"
+        envkey = f"{self._env_prefix}_{suffix}"
+        os.environ[envkey] = norm
+        persisted = _ircx_envfile_set(envkey, norm)
+        note = "" if persisted else (" (warning: IRCX_CONFIG_FILE not set; change is in-memory "
+                                     "only and lost on restart)")
+        if apply == "hot":
+            try:
+                new = load_config(self._platform_config, env_prefix=self._env_prefix)
+                for a in _HOT_CFG_ATTRS:
+                    if hasattr(new, a):
+                        setattr(self.cfg, a, getattr(new, a))
+            except Exception as e:
+                return f"{suffix.lower()} = {norm} saved, but live apply failed: {e}{note}"
+            return f"{suffix.lower()} = {norm}  [applied live]{note}"
+        return f"{suffix.lower()} = {norm}  [saved; run '{p} restart' to apply]{note}"
+
+    def _ircx_admin_restart(self) -> str:
+        try:
+            from gateway.run import _gateway_runner_ref  # type: ignore
+            runner = _gateway_runner_ref()
+            if runner is None:
+                return "cannot restart: gateway runner not available in this process"
+            if not hasattr(runner, "request_restart"):
+                return "cannot restart: this gateway build has no request_restart hook"
+            runner.request_restart(via_service=True)
+            return "restarting the gateway now (service restart). Reconnecting shortly..."
+        except Exception as e:
+            return f"restart failed: {e}"
 
     def _should_chime_in(self, target: str) -> bool:
         """Probability + per-channel cooldown gate for spontaneous replies."""
@@ -3518,6 +3759,9 @@ def _register_network(ctx: Any, platform_name: str, env_prefix: str, label: str)
 
 def register(ctx: Any) -> None:
     """Plugin entry point - called by the Hermes plugin system."""
+    # Overlay the optional ircx.env (IRCX_CONFIG_FILE) before building configs,
+    # so values persisted by ".ircx set" take effect.
+    _load_ircx_env_file()
     _register_network(ctx, "ircx", "IRCX", "IRC")
 
     # Additional IRC networks in the SAME gateway (shared agent memory):

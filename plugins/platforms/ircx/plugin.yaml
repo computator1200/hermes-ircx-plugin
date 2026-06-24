@@ -1,7 +1,7 @@
 name: ircx-platform
 label: IRC
 kind: platform
-version: 1.9.0
+version: 1.10.0
 description: >
   Full-featured IRCv3 gateway adapter for Hermes Agent.  Connects to one or
   more IRC channels (and DMs) and relays messages to/from the Hermes agent.
@@ -178,8 +178,16 @@ optional_env:
     prompt: "Enable .ircx control commands? (true/false)"
     password: false
   - name: IRCX_COMMAND_PREFIX
-    description: "Prefix that marks a control command (default: '.ircx'). e.g. '.ircx model <name>'. IRC clients eat a leading '/', so a non-slash prefix is used."
-    prompt: "Command prefix"
+    description: "Prefix for AGENT/gateway control commands (default: '.agent'). e.g. '.agent model <name>', '.agent reset'. These bridge to the central gateway slash commands. IRC clients eat a leading '/', so a non-slash prefix is used."
+    prompt: "Agent command prefix"
+    password: false
+  - name: IRCX_ADMIN_PREFIX
+    description: "Prefix for live ADAPTER config commands (default: '.ircx'). e.g. '.ircx set observe_mode true', '.ircx list', '.ircx restart'. Configures this IRC plugin itself, persisting to IRCX_CONFIG_FILE. Authorized users only; secrets are masked and not settable in chat."
+    prompt: "Adapter command prefix"
+    password: false
+  - name: IRCX_CONFIG_FILE
+    description: "Path to a dedicated ircx.env (dotenv) holding this plugin's IRCX_* options, kept separate from the main profile .env. Loaded on top of the environment at startup; '.ircx set' persists changes here. Recommended: <profile>/ircx.env. If unset, '.ircx set' changes are in-memory only (lost on restart)."
+    prompt: "ircx config file path (or empty)"
     password: false
   # -- Raw IRC --
   - name: IRCX_ALLOW_RAW
