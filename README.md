@@ -1,6 +1,6 @@
 <!-- Logo -->
 <p align="center">
-  <img src="assets/logo.png" alt="hermes-ircx-plugin" width="240">
+  <img src="assets/hermes-ircx-plugin-logo.png" alt="hermes-ircx-plugin" width="240">
 </p>
 
 <!-- Badges / stickers -->
