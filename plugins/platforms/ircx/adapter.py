@@ -2232,12 +2232,12 @@ class IRCXAdapter(BasePlatformAdapter):
         Returns True if the message was a command (handled or swallowed), False
         to fall through to normal message handling. Authorized users only.
         """
-        prefix = (self.cfg.command_prefix or ".ircx").strip()
+        prefix = (self.cfg.command_prefix or ".agent").strip()
         plow = prefix.lower()
         raw = (text or "").strip()
         body_src = raw
         if not raw.lower().startswith(plow):
-            # Tolerate a leading mention in channels: "Bot: .ircx <cmd>".
+            # Tolerate a leading mention in channels: "Bot: .agent <cmd>".
             s2, addressed = self._strip_mention(text or "")
             s2 = s2.strip()
             if addressed and s2.lower().startswith(plow):
@@ -2263,6 +2263,28 @@ class IRCXAdapter(BasePlatformAdapter):
         if body == "" or body.split()[0].lower() in ("help", "commands", "?", "h"):
             await self.send(chat_id, self._ircx_help_text())
             return True
+
+        # Resolve the command to (a) guard unknown commands and (b) special-case
+        # model swaps. Falls back to letting the gateway decide if we can't check.
+        first = body.split()[0]
+        canonical = first.lower()
+        try:
+            from hermes_cli.commands import resolve_command, is_gateway_known_command  # type: ignore
+            _cd = resolve_command(first)
+            canonical = _cd.name if _cd else first.lower()
+            if not is_gateway_known_command(canonical):
+                await self.send(chat_id, f"unknown command: {prefix} {first}. Try '{prefix} help'.")
+                return True
+        except Exception:
+            pass  # cannot validate here; let the gateway handle/answer it
+
+        # Model swaps from chat default to THIS session only (no config write),
+        # matching "temporary unless I say so". Opt in to saving:
+        #   {prefix} model <name> --persist  -> save to THIS profile's config.yaml
+        #   {prefix} model <name> --global   -> save to shared config (all profiles)
+        #   {prefix} model <name> --session  -> explicit session-only (= default)
+        if canonical == "model":
+            body = self._model_persist_default(body)
 
         # Rewrite to a gateway slash command and dispatch through the normal
         # MessageEvent path - the gateway resolves, access-checks, runs it, and
@@ -2290,6 +2312,21 @@ class IRCXAdapter(BasePlatformAdapter):
         logger.info("IRCX: bridging command %r -> %s (from %s)", body, slash_text, sender_nick)
         await self.handle_message(event)
         return True
+
+    def _model_persist_default(self, body: str) -> str:
+        """Make ".agent model <name>" session-only by default. Explicit
+        --session/--global pass through; --persist/--save (bridge aliases) are
+        stripped so the gateway's persist-by-default writes to THIS profile."""
+        toks = body.split()
+        if not any(not t.startswith("--") for t in toks[1:]):
+            return body  # ".agent model" with no model arg = show current; leave it
+        low = body.lower()
+        if "--session" in low or "--global" in low:
+            return body
+        kept = [t for t in toks if t.lower() not in ("--persist", "--save")]
+        if len(kept) != len(toks):
+            return " ".join(kept)  # --persist/--save -> let core persist to this profile
+        return body + " --session"  # default: temporary, this session only
 
     def _ircx_help_text(self) -> str:
         """Compact, IRC-friendly listing of the agent/gateway control commands,
