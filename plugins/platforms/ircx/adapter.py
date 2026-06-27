@@ -1961,7 +1961,11 @@ class IRCXAdapter(BasePlatformAdapter):
 
     # ---- lifecycle --------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False, **_kwargs: Any) -> bool:
+        # Signature mirrors BasePlatformAdapter.connect(*, is_reconnect=...); the
+        # gateway passes is_reconnect on its (re)connect path. We accept it (and
+        # tolerate any future kwargs) even though IRCX rebuilds state the same way
+        # on a fresh connect and a reconnect.
         if not _LIBS_OK:
             self._set_fatal_error("deps_missing", f"{INSTALL_HINT} ({_LIBS_ERR})", retryable=False)
             return False
